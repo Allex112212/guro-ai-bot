@@ -237,6 +237,7 @@ DEFAULT_ABOUT_TEXT = """Закрытый канал Студии Гуро."""
 ABOUT_TEXT = os.getenv("ABOUT_TEXT", DEFAULT_ABOUT_TEXT).replace('\\n', '\n')
 
 PAYMENT_DOMAIN = os.getenv("PAYMENT_DOMAIN", "")
+OFFER_URL = os.getenv("OFFER_URL", "")  # ссылка на оферту (telegra.ph)
 INTERNAL_WEBHOOK_URL = os.getenv("INTERNAL_WEBHOOK_URL", "http://localhost:8000")
 
 # Обновляем словари для переводов
@@ -878,6 +879,10 @@ def show_main_menu(message):
         if btn_support: # Добавляем кнопку поддержки, если она была создана
             markup.add(btn_support)
         
+    # Оферта (23.11.2026): кнопка появляется, когда в настройках задан OFFER_URL
+    if OFFER_URL:
+        markup.add(types.InlineKeyboardButton('📋 Оферта', url=OFFER_URL))
+
     # Отправляем меню отдельным сообщением
     try:
         bot.send_message( # Используем send_message для надежности
