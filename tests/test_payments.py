@@ -289,6 +289,36 @@ B.link_command(SimpleNamespace(from_user=SimpleNamespace(id="nobody"), chat=Simp
 check("/link: подписчик получает ссылку", any(c == "u1" and "invite" in t for c, t in SENT))
 check("/link: без подписки — отказ", any(c == "nobody" and "Активной подписки" in t for c, t in SENT))
 
+# 20. «Залипшая» дата Lava: два разных продления с одинаковым timestamp засчитываются оба
+stale = "2025-08-27T00:00:00+00:00"
+webhook("payment.success", "u8", amount=2000, contract="c-u8")
+set_end("u8", datetime.now(timezone.utc) + timedelta(days=1))
+webhook("subscription.recurring.payment.success", "u8", amount=2000, contract="r8-1", parent="c-u8", timestamp=stale)
+webhook("subscription.recurring.payment.success", "u8", amount=2000, contract="r8-2", parent="c-u8", timestamp=stale)
+check("два продления с одинаковой датой Lava → оба засчитаны (1+30+30)",
+      60.9 < days_from_now(member("u8")[1]) < 61.1, f"{days_from_now(member('u8')[1]):.1f} дн")
+
+# 21. Повтор того же продления с другой датой всё равно гасится
+before8 = member("u8")[1]
+r = webhook("subscription.recurring.payment.success", "u8", amount=2000, contract="r8-2", parent="c-u8",
+            timestamp="2026-11-23T10:00:00+00:00")
+check("повтор продления с другой датой → не задваивается", member("u8")[1] == before8 and r.get("message") == "duplicate")
+
+# 22. Автопродление «включено», а продления нет (сбой Lava) → не удаляем, пишем админу раз в день
+webhook("payment.success", "u9", amount=2000, contract="c-u9")
+MEMBERS["u9"] = "member"
+set_end("u9", datetime.now(timezone.utc) - timedelta(days=5), status="active")
+SENT.clear()
+B.check_subscription_expiration()
+B.check_subscription_expiration()
+alerts = [t for c, t in SENT if c == "111" and "Проверь в Lava" in t and "u9" in t]
+check("active без продления: не удалён", MEMBERS["u9"] == "member" and member("u9")[0] == "active")
+check("active без продления: админу одно сообщение в день", len(alerts) == 1, f"{len(alerts)} шт")
+
+# 23. /remove — ручное удаление админом
+B.remove_command(SimpleNamespace(from_user=SimpleNamespace(id=111), chat=SimpleNamespace(id=111), text="/remove u9"))
+check("/remove удаляет", MEMBERS["u9"] == "kicked" and member("u9")[0] == "removed")
+
 # 19. /shorten принимает только ссылки Lava
 r = client.post("/shorten", auth=AUTH, json={"original_url": "https://evil.example/x"})
 check("/shorten отклоняет чужие ссылки", r.status_code != 200, r.status_code)

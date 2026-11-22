@@ -388,8 +388,11 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
         
         # Защита от повторов (23.11.2026): Lava повторяет вебхук до 20 раз, если не получила 2xx
         # за 10 секунд. Одно и то же событие обрабатываем один раз.
+        # Дату Lava в ключ не берём: она бывает неверной (29.10.2025 приходила дата августа),
+        # и два разных продления могли бы склеиться. Повтором считаем то же событие по тому же
+        # договору в течение 24 часов (Lava повторяет максимум ~5 часов).
         event_key = (payload_dict.get("eventId") or payload_dict.get("event_id")
-                     or f"{payload.eventType}:{payload.contractId}:{payload.timestamp or ''}")
+                     or f"{payload.eventType}:{payload.contractId}")
         if not claim_event(event_key):
             logger.info(f"Повтор вебхука {event_key} — уже обработан, пропускаем")
             return {"status": "success", "message": "duplicate"}
@@ -800,15 +803,30 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
         return {"status": "error", "message": str(e)}
 
 
+DEDUP_WINDOW = timedelta(hours=24)
+
+
 def claim_event(event_key: str) -> bool:
-    """Помечает событие как обработанное. False — если оно уже было."""
+    """Помечает событие как обработанное. False — если такое же было за последние 24 часа."""
     conn = sqlite3.connect(DB_PATH, timeout=10)
     try:
         conn.execute("CREATE TABLE IF NOT EXISTS processed_events (event_key TEXT PRIMARY KEY, received_at TEXT NOT NULL)")
-        cur = conn.execute("INSERT OR IGNORE INTO processed_events VALUES (?, ?)",
-                           (event_key, datetime.now(timezone.utc).isoformat()))
+        conn.execute("BEGIN IMMEDIATE")  # атомарно: два одновременных повтора не пройдут оба
+        now = datetime.now(timezone.utc)
+        row = conn.execute("SELECT received_at FROM processed_events WHERE event_key = ?",
+                           (event_key,)).fetchone()
+        if row:
+            try:
+                prev = datetime.fromisoformat(row[0])
+                prev = prev if prev.tzinfo else prev.replace(tzinfo=timezone.utc)
+            except Exception:
+                prev = now
+            if now - prev < DEDUP_WINDOW:
+                conn.commit()
+                return False
+        conn.execute("INSERT OR REPLACE INTO processed_events VALUES (?, ?)", (event_key, now.isoformat()))
         conn.commit()
-        return cur.rowcount == 1
+        return True
     finally:
         conn.close()
 

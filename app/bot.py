@@ -1508,6 +1508,22 @@ def check_subscription_expiration():
                 if is_member:
                     if has_expired and paused:
                         logger.info(f"Пауза удалений: {user_id} остаётся в канале (подписка истекла {end_date_str})")
+                    elif (has_expired and member_status == 'active'
+                          and days_after_expiry >= GRACE_PERIOD_DAYS):
+                        # Автопродление числится включённым, а уведомления о продлении нет.
+                        # По истории Lava (2025–2026) это чаще сбой доставки, чем неоплата —
+                        # не удаляем автоматически, просим Гуро проверить (23.11.2026).
+                        alert_key = f"alert_active_expired_{user_id}"
+                        if get_setting(alert_key) != current_date_iso:
+                            set_setting(alert_key, current_date_iso)
+                            notify_admin(
+                                f"❓ <b>Проверь в Lava</b>\n\n"
+                                f"<b>Пользователь:</b> {user_id}\n"
+                                f"Срок истёк {end_date_str}, но автопродление числится включённым, "
+                                f"а уведомления о продлении не было.\n\n"
+                                f"Если оплата есть в Lava — нажми там «повторить» вебхук.\n"
+                                f"Если не оплачено — /remove {user_id}"
+                            )
                     elif has_expired:
                         if days_after_expiry >= GRACE_PERIOD_DAYS:
                             logger.info(
@@ -1589,7 +1605,9 @@ def check_subscription_expiration():
                                 ''', (user_id, current_date_iso))
                                 conn.commit()
                             
-                            if should_notify:
+                            # Только тем, кто сам выключил продление: человеку с включённым
+                            # автопродлением «оформите новую» = риск двойной оплаты (23.11.2026)
+                            if should_notify and member_status == 'cancelled':
                                 days_grace_left = max(0, GRACE_PERIOD_DAYS - days_after_expiry)
                                 try:
                                     bot.send_message(
@@ -1946,6 +1964,28 @@ def link_command(message):
         notify_admin(f"⚠️ /link не сработал для {user_id}")
 
 
+@bot.message_handler(commands=['remove'])
+def remove_command(message):
+    """Ручное удаление админом: /remove <telegram_id> (23.11.2026)."""
+    if not _is_admin(message):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Формат: /remove <telegram_id>")
+        return
+    target = parts[1].strip()
+    if remove_user_from_channel(target):
+        conn = _db()
+        try:
+            conn.execute("UPDATE channel_members SET status = 'removed' WHERE user_id = ?", (target,))
+            conn.commit()
+        finally:
+            conn.close()
+        bot.reply_to(message, f"Удалил {target} из канала.")
+    else:
+        bot.reply_to(message, f"Не получилось удалить {target}, смотри логи.")
+
+
 @bot.message_handler(commands=['removals_off'])
 def removals_off_command(message):
     if not _is_admin(message):
@@ -1981,6 +2021,7 @@ def admin_help_command(message):
         "/removals_off — поставить удаление из канала на паузу (если у Lava сбой)\n"
         "/removals_on — снова включить удаление\n"
         "/backup — прислать копию базы\n"
+        "/remove ID — удалить человека из канала вручную\n"
         "/broadcast текст — рассылка\n\n"
         f"Удаление из канала сейчас: {state}"
     )
