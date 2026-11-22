@@ -191,7 +191,7 @@ webhook("subscription.recurring.payment.failed", "u1", amount=2000, contract="r-
         errorMessage="Insufficient funds")
 after = member("u1")
 check("неудачное продление не меняет доступ", before == after)
-check("неудачное продление: сообщение человеку", any(c == "u1" and "не прошло" in t for c, t in SENT))
+check("неудачное продление: сообщение человеку", any(c == "u1" and "Не получилось списать" in t for c, t in SENT))
 check("неудачное продление: сообщение админу", any(c == "111" and "Продление не прошло" in t for c, t in SENT))
 
 # 7. Отмена автопродления → напоминание за 3 дня, один раз в день
@@ -204,7 +204,7 @@ MEMBERS["u2"] = "member"
 SENT.clear()
 B.check_subscription_expiration()
 B.check_subscription_expiration()
-reminders = [t for c, t in SENT if c == "u2" and "Доступ к каналу закончится" in t]
+reminders = [t for c, t in SENT if c == "u2" and "Напоминаю: доступ в клуб открыт" in t]
 check("отмена → статус cancelled", st == "cancelled", st)
 check("напоминание за 3 дня приходит ровно один раз", len(reminders) == 1, f"{len(reminders)} шт")
 
@@ -288,7 +288,7 @@ check("пустой PAYMENT_DOMAIN → исходная ссылка", B.shorten
 SENT.clear()
 B.link_command(SimpleNamespace(from_user=SimpleNamespace(id="u1"), chat=SimpleNamespace(id="u1"), text="/link"))
 B.link_command(SimpleNamespace(from_user=SimpleNamespace(id="nobody"), chat=SimpleNamespace(id="nobody"), text="/link"))
-check("/link: подписчик получает ссылку", any(c == "u1" and "invite" in t for c, t in SENT))
+check("/link: подписчик получает ссылку", any(c == "u1" and "ты на ночной смене" in t for c, t in SENT))
 check("/link: без подписки — отказ", any(c == "nobody" and "Активной подписки" in t for c, t in SENT))
 
 # 20. «Залипшая» дата Lava: два разных продления с одинаковым timestamp засчитываются оба
@@ -368,6 +368,39 @@ check("цены из Lava запоминаются (1 запрос на 3 отк
 # 19. /shorten принимает только ссылки Lava
 r = client.post("/shorten", auth=AUTH, json={"original_url": "https://evil.example/x"})
 check("/shorten отклоняет чужие ссылки", r.status_code != 200, r.status_code)
+
+# 28. Вход по заявке: подписчика пускаем, чужого (пересланная ссылка) — нет
+APPROVED, DECLINED = [], []
+B.bot.approve_chat_join_request = lambda chat_id, uid: APPROVED.append(str(uid))
+B.bot.decline_chat_join_request = lambda chat_id, uid: DECLINED.append(str(uid))
+B.on_join_request(SimpleNamespace(chat=SimpleNamespace(id=-100500), from_user=SimpleNamespace(id="u1")))
+B.on_join_request(SimpleNamespace(chat=SimpleNamespace(id=-100500), from_user=SimpleNamespace(id="friend")))
+check("заявка подписчика одобрена", "u1" in APPROVED)
+check("заявка чужого (пересланная ссылка) отклонена", "friend" in DECLINED and "friend" not in APPROVED)
+
+# 29. Ссылка-приглашение создаётся «по заявке», без лимита участников
+captured = {}
+B.bot.create_chat_invite_link = lambda **kw: captured.update(kw) or SimpleNamespace(invite_link="https://t.me/+x")
+B.add_user_to_channel("u1")
+check("ссылка в клуб — по заявке", captured.get("creates_join_request") is True and "member_limit" not in captured)
+
+# 30. Отзыв при отмене: кнопка-причина сохраняется и приходит Гуро
+SENT.clear()
+fb_call = SimpleNamespace(id="c", data="fb|price", from_user=SimpleNamespace(id="u1", username="tester"),
+                          message=SimpleNamespace(chat=SimpleNamespace(id="u1"), message_id=5))
+B.feedback_callback(fb_call)
+import sqlite3 as _sq
+_c = _sq.connect(B.DB_PATH); rows = _c.execute("SELECT reason FROM feedback WHERE user_id='u1'").fetchall(); _c.close()
+check("отзыв-кнопка сохранён", ("price",) in rows)
+check("отзыв приходит Гуро", any(c == "111" and "Отзыв при отмене" in t and "Дорого" in t for c, t in SENT))
+
+# 31. Отзыв своими словами сохраняется; команда вместо текста — не сохраняется
+B._feedback_text_step(SimpleNamespace(text="Мало уроков про звук", from_user=SimpleNamespace(id="u1", username="tester"),
+                                      chat=SimpleNamespace(id="u1")))
+B._feedback_text_step(SimpleNamespace(text="/start", from_user=SimpleNamespace(id="u1", username="tester"),
+                                      chat=SimpleNamespace(id="u1")))
+_c = _sq.connect(B.DB_PATH); texts = [r[0] for r in _c.execute("SELECT text FROM feedback WHERE user_id='u1' AND text IS NOT NULL")]; _c.close()
+check("отзыв словами сохранён, команда — нет", texts == ["Мало уроков про звук"], texts)
 
 client.__exit__(None, None, None)
 

@@ -482,14 +482,7 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
             )
 
             # Отправляем уведомление пользователю (сбой Telegram не должен ломать обработку)
-            try:
-                bot.send_message(
-                    user_id,
-                    f"✅ Поздравляем! Ваша подписка '{payload.product.title}' успешно оплачена.\n"
-                    f"Сумма: {payload.amount} {payload.currency}"
-                )
-            except Exception as e:
-                logger.warning(f"Не удалось написать {user_id} об оплате: {e}")
+            # Отдельное «Поздравляем…» убрано (23.11.2026): одно сообщение со ссылкой шлёт add_user_to_channel
             
             # Добавляем пользователя в канал
             if add_user_to_channel(user_id):
@@ -508,8 +501,8 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
                 try:
                     bot.send_message(
                         user_id,
-                        "✅ Оплата прошла, но ссылку в канал прислать не получилось.\n"
-                        "Нажмите /link — пришлю новую. Если не выйдет, напишите в поддержку."
+                        "Оплата прошла, но ссылка в клуб не создалась. Нажми /link, пришлю новую. "
+                        f"Если и так не выйдет, напиши мне: @{SUPPORT_USERNAME}"
                     )
                 except Exception as e:
                     logger.warning(f"Не удалось написать {user_id} про /link: {e}")
@@ -606,8 +599,8 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
                 markup.add(btn_channel, btn_menu)
                 bot.send_message(
                     user_id,
-                    f"✅ Ваша подписка '{payload.product.title}' автоматически продлена!\n"
-                    f"Новая дата окончания: {new_end_date_dt.strftime('%d.%m.%Y')}",
+                    f"Подписка продлена, ты в клубе до {new_end_date_dt.strftime('%d.%m.%Y')}. "
+                    f"Спасибо, что остаёшься 🌙",
                     reply_markup=markup
                 )
             except Exception as e:
@@ -700,8 +693,8 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
                 end_date_str = new_end.strftime("%d.%m.%Y")
                 bot.send_message(
                     user_id,
-                    f"ℹ️ Автопродление подписки отключено.\n\n"
-                    f"Доступ к каналу будет действовать до: {end_date_str}."
+                    f"Автопродление выключено. Ты в клубе до {end_date_str}.\n"
+                    f"Если решишь вернуться, всё будет здесь: /subscribe"
                 )
                 menu_message = bot.send_message(user_id, "⠀⠀⠀⠀⠀Меню подписчика⠀⠀⠀⠀⠀")
                 show_main_menu(menu_message)
@@ -715,7 +708,7 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
                 logger.warning(f"Отмена подписки для {user_id} через webhook, но без willExpireAt.")
                 bot.send_message(
                     user_id,
-                    "ℹ️ Автопродление подписки отключено."
+                    "Автопродление выключено. Если решишь вернуться: /subscribe"
                 )
                 menu_message = bot.send_message(user_id, "⠀⠀⠀⠀⠀Меню подписчика⠀⠀⠀⠀⠀")
                 show_main_menu(menu_message)
@@ -737,9 +730,8 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
             try:
                 bot.send_message(
                     user_id,
-                    "⚠️ Не получилось продлить подписку: списание не прошло.\n"
-                    "Проверьте карту или баланс. Доступ пока сохраняется.\n\n"
-                    "Если продление так и не пройдёт, оформить подписку заново можно через /subscribe"
+                    "Не получилось списать оплату за следующий месяц. Проверь карту или баланс.\n"
+                    "Доступ пока открыт, Lava попробует ещё раз."
                 )
             except Exception as e:
                 logger.warning(f"Не удалось написать {user_id} о неудачном продлении: {e}")
@@ -766,9 +758,8 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
 
             bot.send_message(
                 user_id,
-                f"❌ К сожалению, оплата подписки '{payload.product.title}' не удалась.\n"
-                f"Причина: {payload.errorMessage}\n\n"
-                f"Вы можете попробовать снова, используя команду /subscribe"
+                "Оплата не прошла, деньги не списаны. Можно попробовать ещё раз: /subscribe\n"
+                "Если не получается с картой, напиши мне."
             )
             
             # Показываем основное меню
