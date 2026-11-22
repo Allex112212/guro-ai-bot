@@ -153,6 +153,11 @@ def init_db():
 
 # Проверка авторизации
 def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
+    # С паролем по умолчанию сервис закрыт целиком (23.11.2026)
+    if not PASSWORD or PASSWORD == "password":
+        logger.error("WEBHOOK_PASSWORD не задан или стандартный — вебхуки не принимаются")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Webhook password is not configured")
     correct_username = secrets.compare_digest(credentials.username, USERNAME)
     correct_password = secrets.compare_digest(credentials.password, PASSWORD)
     
@@ -353,14 +358,14 @@ async def root(_: str = Depends(verify_credentials)):
 
 @app.post("/lava/payment")
 async def lava_webhook(request: Request, username: str = Depends(verify_credentials)):
+    event_key = None
+    committed = False  # True, как только срок/статус записан в базу
     try:
         # Получаем тело запроса
         body = await request.body()
         raw_data = body.decode("utf-8")
-        
-        # Логируем входящие данные
-        logger.info(f"Получены данные от lava.top: {raw_data}")
-        
+        # Сырое тело не логируем целиком (23.11.2026) — ниже пишется краткая строка
+
         # Используем время получения вебхука вместо ненадежного timestamp из payload
         webhook_received_time = datetime.now(timezone.utc)
         
@@ -381,15 +386,24 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
             payload.currency or ""
         )
         
+        # Защита от повторов (23.11.2026): Lava повторяет вебхук до 20 раз, если не получила 2xx
+        # за 10 секунд. Одно и то же событие обрабатываем один раз.
+        event_key = (payload_dict.get("eventId") or payload_dict.get("event_id")
+                     or f"{payload.eventType}:{payload.contractId}:{payload.timestamp or ''}")
+        if not claim_event(event_key):
+            logger.info(f"Повтор вебхука {event_key} — уже обработан, пропускаем")
+            return {"status": "success", "message": "duplicate"}
+
         # Сохраняем в БД
         payment_id = save_to_db(payload, raw_data)
-        
+
         # Получаем user_id из email
         user_id = payload.buyer.email.split('@')[0]
-        
-        # Импортируем функции из bot.py
+
+        # Импортируем функции из bot.py (все имена здесь, чтобы не было «локальных» импортов ниже)
         from bot import (add_user_to_channel, notify_admin, bot, PERIOD_DAYS,
-                         resolve_periodicity, remember_confirmed_periodicity)
+                         resolve_periodicity, remember_confirmed_periodicity,
+                         types, CHANNEL_LINK, SUPPORT_USERNAME, show_main_menu)
 
         def _current_end(uid):
             """Текущая дата окончания из базы (или None)."""
@@ -455,20 +469,24 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
             cursor.execute('DELETE FROM subscription_reminders WHERE user_id = ?', (user_id,))
             conn.commit()
             conn.close()
-            
+            committed = True
+
             logger.info(
                 "payment.success.persisted | user=%s status=active subscription_end_date=%s payment_id=%s",
                 user_id,
                 subscription_end_date,
                 str(payment_id)
             )
-            
-            # Отправляем уведомление пользователю
-            bot.send_message(
-                user_id,
-                f"✅ Поздравляем! Ваша подписка '{payload.product.title}' успешно оплачена.\n"
-                f"Сумма: {payload.amount} {payload.currency}"
-            )
+
+            # Отправляем уведомление пользователю (сбой Telegram не должен ломать обработку)
+            try:
+                bot.send_message(
+                    user_id,
+                    f"✅ Поздравляем! Ваша подписка '{payload.product.title}' успешно оплачена.\n"
+                    f"Сумма: {payload.amount} {payload.currency}"
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось написать {user_id} об оплате: {e}")
             
             # Добавляем пользователя в канал
             if add_user_to_channel(user_id):
@@ -483,7 +501,22 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
                 )
             else:
                 logger.error(f"Не удалось добавить пользователя {user_id} в канал")
-                
+                # Оплата есть, ссылки нет — человек может запросить её сам, админ в курсе
+                try:
+                    bot.send_message(
+                        user_id,
+                        "✅ Оплата прошла, но ссылку в канал прислать не получилось.\n"
+                        "Нажмите /link — пришлю новую. Если не выйдет, напишите в поддержку."
+                    )
+                except Exception as e:
+                    logger.warning(f"Не удалось написать {user_id} про /link: {e}")
+                notify_admin(
+                    f"⚠️ <b>Оплата есть, ссылку выдать не удалось</b>\n\n"
+                    f"<b>Пользователь:</b> {user_id}\n"
+                    f"<b>Сумма:</b> {payload.amount} {payload.currency}\n"
+                    f"Проверь, что бот — админ канала с правом приглашать."
+                )
+
         # Обрабатываем автоматическое продление подписки
         elif payload.eventType == "subscription.recurring.payment.success":
             logger.info(
@@ -553,6 +586,7 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
             cursor.execute('DELETE FROM subscription_reminders WHERE user_id = ?', (user_id,))
             conn.commit()
             conn.close()
+            committed = True
 
             logger.info(
                 "recurring.persisted | user=%s status=active subscription_end_date=%s payment_id=%s",
@@ -561,20 +595,20 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
                 str(payment_id)
             )
 
-            # Отправляем уведомление пользователю
-            from bot import types, CHANNEL_LINK, show_main_menu
-
-            markup = types.InlineKeyboardMarkup(row_width=1)
-            btn_channel = types.InlineKeyboardButton('📺 Войти в канал', url=CHANNEL_LINK)
-            btn_menu = types.InlineKeyboardButton('🔙 Главное меню', callback_data='show_menu')
-            markup.add(btn_channel, btn_menu)
-
-            bot.send_message(
-                user_id,
-                f"✅ Ваша подписка '{payload.product.title}' автоматически продлена!\n"
-                f"Новая дата окончания: {new_end_date_dt.strftime('%d.%m.%Y')}",
-                reply_markup=markup
-            )
+            # Отправляем уведомление пользователю (сбой Telegram не ломает обработку)
+            try:
+                markup = types.InlineKeyboardMarkup(row_width=1)
+                btn_channel = types.InlineKeyboardButton('📺 Войти в канал', url=CHANNEL_LINK)
+                btn_menu = types.InlineKeyboardButton('🔙 Главное меню', callback_data='show_menu')
+                markup.add(btn_channel, btn_menu)
+                bot.send_message(
+                    user_id,
+                    f"✅ Ваша подписка '{payload.product.title}' автоматически продлена!\n"
+                    f"Новая дата окончания: {new_end_date_dt.strftime('%d.%m.%Y')}",
+                    reply_markup=markup
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось написать {user_id} о продлении: {e}")
 
             # Уведомляем администратора
             formatted_end_date = new_end_date_dt.strftime('%d.%m.%Y')
@@ -604,20 +638,49 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
             cursor.execute('SELECT status FROM channel_members WHERE user_id = ?', (user_id,))
             current_status_row = cursor.fetchone()
             current_status = current_status_row[0] if current_status_row else None
-            
+
+            # Отмена старого договора не должна трогать новую подписку (23.11.2026):
+            # сверяем договор с последней успешной оплатой человека.
+            last_paid = cursor.execute('''
+                SELECT COALESCE(parent_contract_id, contract_id) FROM payments
+                WHERE buyer_email = ? AND event_type IN ('payment.success', 'subscription.recurring.payment.success')
+                ORDER BY id DESC LIMIT 1''', (payload.buyer.email,)).fetchone()
+            cancel_ids = {payload.contractId, payload.parentContractId} - {None}
+            if last_paid and last_paid[0] and last_paid[0] not in cancel_ids:
+                conn.close()
+                committed = True
+                logger.warning(f"Отмена договора {cancel_ids} для {user_id} не совпадает с текущим {last_paid[0]} — игнорируем")
+                notify_admin(
+                    f"ℹ️ <b>Отмена старого договора</b>\n\nПользователь: {user_id}\n"
+                    f"Текущую подписку не трогаю."
+                )
+                return {"status": "success", "message": "Cancel for old contract ignored"}
+
+            # Срок не укорачиваем и не обнуляем: берём max(текущий, willExpireAt)
+            new_end = _current_end(user_id)
+            will_expire = normalize_datetime_string(payload.willExpireAt)
+            if will_expire:
+                try:
+                    we = datetime.fromisoformat(will_expire.replace('Z', '+00:00'))
+                    we = we if we.tzinfo else we.replace(tzinfo=timezone.utc)
+                    new_end = max(new_end, we) if new_end else we
+                except Exception:
+                    pass
+
             # Обновляем статус только если он был 'active' (чтобы не обрабатывать повторные webhook'и)
             cursor.execute('''
-            UPDATE channel_members 
+            UPDATE channel_members
             SET status = 'cancelled',
-                subscription_end_date = ?
+                subscription_end_date = COALESCE(?, subscription_end_date)
             WHERE user_id = ? AND status = 'active'
             ''', (
-                normalize_datetime_string(payload.willExpireAt), # Нормализуем дату
+                new_end.isoformat() if new_end else None,
                 user_id
             ))
             rows_updated = cursor.rowcount
             conn.commit()
             conn.close()
+            committed = True
             
             # Отправляем уведомление только если статус действительно изменился
             # (rows_updated > 0 означает, что была обновлена запись со статусом 'active')
@@ -630,11 +693,8 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
                 logger.info(f"Статус подписки пользователя {user_id} обновлен на 'cancelled' (webhook)")
 
             # Отправляем уведомление пользователю только если статус изменился
-            if rows_updated > 0 and payload.willExpireAt:
-                from bot import bot, types, show_main_menu
-                # Используем normalize_datetime_string для получения корректной даты для отображения
-                normalized_will_expire_at = normalize_datetime_string(payload.willExpireAt)
-                end_date_str = datetime.fromisoformat(normalized_will_expire_at.replace('Z', '+00:00')).strftime("%d.%m.%Y") if normalized_will_expire_at else "не определена"
+            if rows_updated > 0 and new_end:
+                end_date_str = new_end.strftime("%d.%m.%Y")
                 bot.send_message(
                     user_id,
                     f"ℹ️ Автопродление подписки отключено.\n\n"
@@ -731,8 +791,37 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
         return {"status": "success", "message": "Webhook processed successfully"}
     
     except Exception as e:
-        logger.error(f"Ошибка при обработке веб-хука: {str(e)}")
+        logger.error(f"Ошибка при обработке веб-хука: {str(e)}", exc_info=True)
+        if event_key and not committed:
+            # Ничего не записали — отпускаем событие и просим Lava повторить (23.11.2026)
+            release_event(event_key)
+            raise HTTPException(status_code=500, detail="processing failed, retry")
+        # Срок уже записан — повтор задвоил бы его; отвечаем 200, ошибку видно в логах
         return {"status": "error", "message": str(e)}
+
+
+def claim_event(event_key: str) -> bool:
+    """Помечает событие как обработанное. False — если оно уже было."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS processed_events (event_key TEXT PRIMARY KEY, received_at TEXT NOT NULL)")
+        cur = conn.execute("INSERT OR IGNORE INTO processed_events VALUES (?, ?)",
+                           (event_key, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def release_event(event_key: str):
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        conn.execute("DELETE FROM processed_events WHERE event_key = ?", (event_key,))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Не удалось снять отметку события {event_key}: {e}")
+    finally:
+        conn.close()
 
 # Эндпоинт /admin/reset_db удалён 23.11.2026: одним запросом стирал всю базу подписчиков.
 
@@ -742,9 +831,15 @@ async def shorten_url(request: ShortenLinkRequest, username: str = Depends(verif
         # Убираем запуск очистки при каждом запросе
         # cleanup_old_shortened_links()
         
+        # Сокращаем только ссылки на оплату Lava (23.11.2026)
+        from urllib.parse import urlparse
+        host = (urlparse(request.original_url).hostname or "").lower()
+        if not (request.original_url.startswith("https://") and (host == "lava.top" or host.endswith(".lava.top"))):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only lava.top links")
+
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        
+
         # Генерируем короткий код
         short_code = generate_short_code(request.original_url)
         

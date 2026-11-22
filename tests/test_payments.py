@@ -44,8 +44,20 @@ def fake_get(url, params=None, headers=None, **kw):
     return resp
 
 
+def fake_post(url, **kw):
+    if "lava.top" in url:  # в Lava из тестов не ходим
+        resp = mock.Mock()
+        resp.status_code = 200
+        resp.raise_for_status = lambda: None
+        resp.json = lambda: {"id": "inv-test", "paymentUrl": "https://app.lava.top/pay/test"}
+        return resp
+    return _real_post(url, **kw)
+
+
 import requests  # noqa: E402
+_real_post = requests.post
 requests.get = fake_get
+requests.post = fake_post
 
 import bot as B  # noqa: E402
 import main as M  # noqa: E402
@@ -181,6 +193,7 @@ check("неудачное продление: сообщение человек�
 check("неудачное продление: сообщение админу", any(c == "111" and "Продление не прошло" in t for c, t in SENT))
 
 # 7. Отмена автопродления → напоминание за 3 дня, один раз в день
+set_end("u2", datetime.now(timezone.utc) + timedelta(days=3, hours=12))
 webhook("subscription.cancelled", "u2", amount=0, contract="c-u2",
         cancelledAt=datetime.now(timezone.utc).isoformat(),
         willExpireAt=(datetime.now(timezone.utc) + timedelta(days=3, hours=12)).isoformat())
@@ -222,6 +235,63 @@ B.removals_on_command(admin_msg)
 check("админ снимает паузу /removals_on", not B.removals_paused())
 B.backup_command(admin_msg)
 check("/backup присылает файл базы", any(c == "111" and t.startswith("DOC:") for c, t in SENT))
+
+# ===== Проверки по замечаниям критика и судьи (23.11.2026) =====
+
+# 12. Повтор одного и того же вебхука не начисляет срок второй раз
+body_ts = datetime.now(timezone.utc).isoformat()
+webhook("payment.success", "u5", amount=2000, contract="c-u5", timestamp=body_ts)
+first = member("u5")[1]
+r = webhook("payment.success", "u5", amount=2000, contract="c-u5", timestamp=body_ts)
+check("повтор вебхука не задваивает срок", member("u5")[1] == first and r.get("message") == "duplicate",
+      f"{days_from_now(member('u5')[1]):.1f} дн")
+
+# 13. Отмена старого договора не трогает новую подписку
+end_before = member("u5")[1]
+webhook("subscription.cancelled", "u5", amount=0, contract="OLD-c",
+        cancelledAt=datetime.now(timezone.utc).isoformat(),
+        willExpireAt=(datetime.now(timezone.utc) + timedelta(days=2)).isoformat())
+st5, end5 = member("u5")
+check("отмена чужого договора не укорачивает срок", st5 == "active" and end5 == end_before, st5)
+
+# 14. Отмена без willExpireAt не обнуляет срок и не падает
+webhook("subscription.cancelled", "u5", amount=0, contract="c-u5",
+        cancelledAt=datetime.now(timezone.utc).isoformat())
+st5, end5 = member("u5")
+check("отмена без даты: срок сохранён, статус cancelled", st5 == "cancelled" and end5 == end_before, st5)
+
+# 15. Сбой до записи → 500 (Lava повторит), повтор после починки проходит
+orig = M.save_to_db
+M.save_to_db = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db locked"))
+body = {"eventType": "payment.success", "product": {"id": "p1", "title": "Клуб"},
+        "buyer": {"email": "u6@t.me"}, "contractId": "c-u6", "amount": 2000, "currency": "RUB",
+        "timestamp": "2026-11-23T00:00:00+00:00", "status": "completed"}
+r = client.post("/lava/payment", auth=AUTH, content=json.dumps(body))
+M.save_to_db = orig
+r2 = client.post("/lava/payment", auth=AUTH, content=json.dumps(body))
+check("сбой до записи → 500, повтор начисляет один раз",
+      r.status_code == 500 and r2.status_code == 200 and member("u6")[0] == "active",
+      f"{r.status_code}/{r2.status_code}")
+
+# 16. Ключ Lava не попадает в логи
+B.create_payment_link("u7", "offer-1", "MONTHLY")
+logs = "".join(p.read_text(encoding="utf-8", errors="ignore") for p in Path(TMP).glob("log_*.log"))
+check("ключ Lava не пишется в лог", os.environ["LAVA_API_KEY"] + "\"" not in logs and "X-Api-Key" not in logs)
+
+# 17. Пустой домен — кнопка оплаты получает исходную ссылку Lava
+B.PAYMENT_DOMAIN = ""
+check("пустой PAYMENT_DOMAIN → исходная ссылка", B.shorten_payment_url("https://app.lava.top/x") == "https://app.lava.top/x")
+
+# 18. /link выдаёт ссылку подписчику и отказывает остальным
+SENT.clear()
+B.link_command(SimpleNamespace(from_user=SimpleNamespace(id="u1"), chat=SimpleNamespace(id="u1"), text="/link"))
+B.link_command(SimpleNamespace(from_user=SimpleNamespace(id="nobody"), chat=SimpleNamespace(id="nobody"), text="/link"))
+check("/link: подписчик получает ссылку", any(c == "u1" and "invite" in t for c, t in SENT))
+check("/link: без подписки — отказ", any(c == "nobody" and "Активной подписки" in t for c, t in SENT))
+
+# 19. /shorten принимает только ссылки Lava
+r = client.post("/shorten", auth=AUTH, json={"original_url": "https://evil.example/x"})
+check("/shorten отклоняет чужие ссылки", r.status_code != 200, r.status_code)
 
 client.__exit__(None, None, None)
 

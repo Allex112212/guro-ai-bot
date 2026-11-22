@@ -276,7 +276,7 @@ def get_available_subscriptions():
     }
     
     try:
-        response = requests.get(url, params=params, headers=headers)
+        response = requests.get(url, params=params, headers=headers, timeout=20)
         response.raise_for_status()
         data = response.json()
         
@@ -352,11 +352,8 @@ def create_payment_link(user_id, offer_id, periodicity, currency="RUB"):
     
     try:
         logger.info(f"Создание ссылки на оплату для пользователя {user_id}")
-        logger.debug(f"URL запроса: {url}")
-        logger.debug(f"Заголовки: {headers}")
-        logger.debug(f"Тело запроса: {payload}")
-        
-        response = requests.post(url, headers=headers, json=payload)
+        # Заголовки не логируем: в них ключ Lava (исправлено 23.11.2026)
+        response = requests.post(url, headers=headers, json=payload, timeout=20)
         logger.debug(f"Код ответа: {response.status_code}")
         logger.debug(f"Тело ответа: {response.text}")
         
@@ -392,16 +389,11 @@ def cancel_subscription(user_id, contract_id):
         }
         
         logger.info(f"Отправка запроса на отмену подписки:")
-        logger.info(f"URL: {url}")
-        logger.info(f"Headers: {headers}")
         logger.info(f"Params: {params}")
-        
-        response = requests.delete(url, headers=headers, params=params)
-        
-        logger.info(f"Ответ от LAVA.TOP:")
-        logger.info(f"Статус: {response.status_code}")
-        logger.info(f"Тело ответа: {response.text}")
-        logger.info(f"Заголовки: {response.headers}")
+        # Заголовки не логируем: в них ключ Lava (исправлено 23.11.2026)
+        response = requests.delete(url, headers=headers, params=params, timeout=20)
+
+        logger.info(f"Ответ от LAVA.TOP: статус {response.status_code}, тело: {response.text[:500]}")
         
         # Проверяем оба кода успешного ответа: 200 и 204
         if response.status_code in [200, 204]:
@@ -1256,6 +1248,9 @@ def process_payment_callback(call):
 
 # Добавляем новую функцию для сокращения ссылки
 def shorten_payment_url(payment_url: str) -> str:
+    # Без своего домена отдаём исходную ссылку Lava (исправлено 23.11.2026)
+    if not PAYMENT_DOMAIN:
+        return payment_url
     try:
         # URL вашего webhook сервиса
         webhook_url = INTERNAL_WEBHOOK_URL
@@ -1267,7 +1262,8 @@ def shorten_payment_url(payment_url: str) -> str:
         response = requests.post(
             f"{webhook_url}/shorten",
             json={"original_url": payment_url},
-            auth=auth
+            auth=auth,
+            timeout=5
         )
 
         if response.status_code == 200:
@@ -1278,6 +1274,7 @@ def shorten_payment_url(payment_url: str) -> str:
             return payment_url            
     except Exception as e:
         logger.error(f"Ошибка при сокращении ссылки: {str(e)}")
+        return payment_url
 
 # Модифицируем функцию process_currency_callback
 @bot.callback_query_handler(func=lambda call: call.data.startswith('c|'))
@@ -1520,17 +1517,32 @@ def check_subscription_expiration():
                                 f"статус в БД: {member_status}"
                             )
                             
+                            # Перед удалением перечитываем срок и паузу: продление могло прийти
+                            # прямо во время обхода (исправлено 23.11.2026)
+                            fresh = cursor.execute(
+                                "SELECT subscription_end_date FROM channel_members WHERE user_id = ?",
+                                (user_id,)).fetchone()
+                            if removals_paused() or not fresh or fresh[0] != end_date_str:
+                                logger.info(f"{user_id}: срок изменился или пауза — не удаляем")
+                                continue
+
                             # Удаляем пользователя из канала
                             result = remove_user_from_channel(user_id)
-                            
+
                             if result:
-                                # Обновляем статус в БД только если он еще не 'removed'
+                                # Статус меняем, только если срок не поменялся за время удаления
                                 cursor.execute('''
-                                UPDATE channel_members 
-                                SET status = 'removed' 
-                                WHERE user_id = ? AND status != 'removed'
-                                ''', (user_id,))
+                                UPDATE channel_members
+                                SET status = 'removed'
+                                WHERE user_id = ? AND status != 'removed' AND subscription_end_date = ?
+                                ''', (user_id, end_date_str))
                                 rows_updated = cursor.rowcount
+                                if rows_updated == 0:
+                                    # Продлили в момент удаления — возвращаем человека
+                                    logger.warning(f"{user_id} продлил во время удаления — выдаём новое приглашение")
+                                    conn.commit()
+                                    add_user_to_channel(user_id)
+                                    continue
                                 cursor.execute('DELETE FROM subscription_reminders WHERE user_id = ?', (user_id,))
                                 conn.commit()
                                 
@@ -1885,7 +1897,20 @@ def send_db_backup(caption="Копия базы бота"):
         if not DB_PATH.exists():
             return False
         stamp = datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M')
-        with open(DB_PATH, 'rb') as f:
+        # Снимок через backup(), а не чтение файла во время записи (23.11.2026)
+        snap_path = DATA_DIR / "backup_snapshot.db"
+        src = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(snap_path)
+        try:
+            src.backup(dst)
+            ok = dst.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        finally:
+            dst.close()
+            src.close()
+        if not ok:
+            logger.error("Копия базы не прошла integrity_check")
+            return False
+        with open(snap_path, 'rb') as f:
             bot.send_document(ADMIN_ID, f, caption=f"💾 {caption} ({stamp} UTC)",
                               visible_file_name=f"backup_{stamp}.db")
         set_setting("last_backup_at", _now_iso())
@@ -1893,6 +1918,32 @@ def send_db_backup(caption="Копия базы бота"):
     except Exception as e:
         logger.error(f"Не удалось отправить копию базы: {e}")
         return False
+
+
+@bot.message_handler(commands=['link'])
+def link_command(message):
+    """Новая ссылка в канал для того, у кого подписка действует (23.11.2026)."""
+    user_id = str(message.from_user.id)
+    conn = _db()
+    try:
+        row = conn.execute("SELECT status, subscription_end_date FROM channel_members WHERE user_id = ?",
+                           (user_id,)).fetchone()
+    finally:
+        conn.close()
+    active = False
+    if row and row[0] in ('active', 'cancelled') and row[1]:
+        try:
+            end = datetime.fromisoformat(row[1].replace('Z', '+00:00'))
+            end = end if end.tzinfo else end.replace(tzinfo=timezone.utc)
+            active = end > datetime.now(timezone.utc)
+        except Exception:
+            active = False
+    if not active:
+        bot.reply_to(message, "Активной подписки не вижу. Оформить: /subscribe")
+        return
+    if not add_user_to_channel(user_id):
+        bot.reply_to(message, "Не получилось создать ссылку. Напишите в поддержку, пожалуйста.")
+        notify_admin(f"⚠️ /link не сработал для {user_id}")
 
 
 @bot.message_handler(commands=['removals_off'])
