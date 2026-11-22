@@ -776,7 +776,7 @@ def show_subscription_menu(message, call=None):
     if currencies & {"USD", "EUR"}:
         markup.add(types.InlineKeyboardButton("🌍 Зарубежная карта", callback_data="pay|FX"))
     markup.add(types.InlineKeyboardButton('← Меню', callback_data='show_menu'))
-    message_text = f"<b>{sub['name']}</b>\n\n{sub['description']}\n\nЧем будешь платить?"
+    message_text = f"<b>{sub['name']}</b>\n\n{sub['description']}\n\nВыберите, пожалуйста, карту:"
     try:
         if call:
             bot.edit_message_text(message_text, chat_id=call.message.chat.id,
@@ -847,7 +847,7 @@ def show_main_menu(message):
     subscription = check_subscription_status(message.chat.id)
     
     # Общие кнопки
-    btn_about = types.InlineKeyboardButton('🎬 Что внутри', callback_data='show_about')
+    btn_about = types.InlineKeyboardButton('👋 Обо мне', callback_data='show_about')
     
     # Создаем кнопку поддержки только если SUPPORT_USERNAME задан
     btn_support = None
@@ -1148,7 +1148,7 @@ def show_status_callback(call):
             # Показываем кнопки для тех, у кого нет подписки
             markup = types.InlineKeyboardMarkup(row_width=1)
             btn_subscribe = types.InlineKeyboardButton('🌙 Вступить в клуб', callback_data='show_subscribe')
-            btn_about = types.InlineKeyboardButton('🎬 Что внутри', callback_data='show_about')
+            btn_about = types.InlineKeyboardButton('👋 Обо мне', callback_data='show_about')
             
             # Создаем кнопку поддержки только если SUPPORT_USERNAME задан
             if SUPPORT_USERNAME:
@@ -1846,7 +1846,7 @@ def status_command(message):
             # Показываем кнопки для тех, у кого нет подписки
             markup = types.InlineKeyboardMarkup(row_width=1)
             btn_subscribe = types.InlineKeyboardButton('🌙 Вступить в клуб', callback_data='show_subscribe')
-            btn_about = types.InlineKeyboardButton('🎬 Что внутри', callback_data='show_about')
+            btn_about = types.InlineKeyboardButton('👋 Обо мне', callback_data='show_about')
             
             if SUPPORT_USERNAME:
                 btn_support = types.InlineKeyboardButton('💬 Написать мне', url=f"https://t.me/{SUPPORT_USERNAME}")
