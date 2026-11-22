@@ -34,15 +34,15 @@ def normalize_datetime_string(dt_str: Optional[str]) -> Optional[str]:
     return dt_obj.isoformat() # Всегда возвращаем в ISO формате с часовым поясом
 
 # Настройка логирования
-DATA_DIR = Path("/mount/database")
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR = Path(os.getenv("DATA_DIR", "/mount/database"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 log_file = DATA_DIR / f"log_{time.strftime('%Y%m%d')}.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(log_file),
+        logging.FileHandler(log_file, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -388,8 +388,25 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
         user_id = payload.buyer.email.split('@')[0]
         
         # Импортируем функции из bot.py
-        from bot import add_user_to_channel, notify_admin, bot, get_periodicity_by_amount, PERIOD_DAYS
-        
+        from bot import (add_user_to_channel, notify_admin, bot, PERIOD_DAYS,
+                         resolve_periodicity, remember_confirmed_periodicity)
+
+        def _current_end(uid):
+            """Текущая дата окончания из базы (или None)."""
+            c = sqlite3.connect(DB_PATH)
+            try:
+                row = c.execute("SELECT subscription_end_date FROM channel_members WHERE user_id = ?",
+                                (uid,)).fetchone()
+            finally:
+                c.close()
+            if row and row[0]:
+                try:
+                    dt = datetime.fromisoformat(str(row[0]).replace('Z', '+00:00'))
+                    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    return None
+            return None
+
         # Обрабатываем успешный платеж
         if payload.eventType == "payment.success":
             logger.info(
@@ -401,10 +418,17 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
                 webhook_received_time.isoformat()
             )
             
-            # Рассчитываем дату окончания подписки от момента получения webhook'а
-            periodicity = get_periodicity_by_amount(payload.amount, payload.currency)
+            # Период — по выбору человека / договору Lava, а не по «похожей» сумме (23.11.2026)
+            contract_ids = (payload.contractId, payload.parentContractId)
+            periodicity, period_source = resolve_periodicity(
+                user_id, payload.amount, payload.currency, contract_ids, recurring=False)
+            remember_confirmed_periodicity(user_id, periodicity, contract_ids)
             days_to_add = PERIOD_DAYS.get(periodicity, 30)
-            subscription_end_date_dt = webhook_received_time + timedelta(days=days_to_add)
+            # Если доступ ещё действует (повторная покупка) — прибавляем к остатку, а не обнуляем
+            base_time = max(webhook_received_time, _current_end(user_id) or webhook_received_time)
+            logger.info("payment.success.period | user=%s periodicity=%s source=%s base=%s",
+                        user_id, periodicity, period_source, base_time.isoformat())
+            subscription_end_date_dt = base_time + timedelta(days=days_to_add)
             subscription_end_date = subscription_end_date_dt.replace(tzinfo=subscription_end_date_dt.tzinfo or timezone.utc).isoformat()
             
             logger.info(
@@ -490,13 +514,21 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
             # Используем время получения вебхука вместо ненадежного timestamp из payload
             event_time = webhook_received_time
 
-            # Определяем периодичность по сумме и валюте и рассчитываем длительность периода
-            periodicity = get_periodicity_by_amount(payload.amount, payload.currency)
+            # Период — по договору Lava / прошлой оплате, а не по «похожей» сумме (23.11.2026)
+            contract_ids = (payload.parentContractId, payload.contractId)
+            periodicity, period_source = resolve_periodicity(
+                user_id, payload.amount, payload.currency, contract_ids, recurring=True)
+            remember_confirmed_periodicity(user_id, periodicity, contract_ids)
             days_to_add = PERIOD_DAYS.get(periodicity, 30)
 
-            # Продлеваем подписку от момента получения webhook'а, добавляя период подписки
-            # Это гарантирует, что пользователь получает ровно столько времени, за сколько оплачена подписка
-            new_end_date_dt = event_time + timedelta(days=days_to_add)
+            # Продлеваем от прежней даты окончания (если она ещё не прошла), а не от момента
+            # уведомления: Lava списывает заранее, человек не должен терять оплаченные дни.
+            if current_end_date.tzinfo is None:
+                current_end_date = current_end_date.replace(tzinfo=timezone.utc)
+            base_time = max(event_time, current_end_date)
+            logger.info("recurring.period | user=%s periodicity=%s source=%s base=%s",
+                        user_id, periodicity, period_source, base_time.isoformat())
+            new_end_date_dt = base_time + timedelta(days=days_to_add)
             new_end_date = new_end_date_dt.replace(tzinfo=new_end_date_dt.tzinfo or timezone.utc).isoformat()
 
             logger.info(
@@ -630,6 +662,31 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
                     f"Доступ был отменен. (Дата окончания не указана)"
                 )
 
+        # Продление не прошло (23.11.2026). Lava повторяет списание и, если не вышло,
+        # присылает subscription.cancelled — тогда сработает обычная отмена.
+        # Здесь только предупреждаем человека и админа, доступ не трогаем.
+        elif payload.eventType == "subscription.recurring.payment.failed":
+            logger.info(
+                "recurring.failed received | user=%s product='%s' reason='%s' webhook_received=%s",
+                user_id, payload.product.title, payload.errorMessage or "",
+                webhook_received_time.isoformat()
+            )
+            try:
+                bot.send_message(
+                    user_id,
+                    "⚠️ Не получилось продлить подписку: списание не прошло.\n"
+                    "Проверьте карту или баланс. Доступ пока сохраняется.\n\n"
+                    "Если продление так и не пройдёт, оформить подписку заново можно через /subscribe"
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось написать {user_id} о неудачном продлении: {e}")
+            notify_admin(
+                f"⚠️ <b>Продление не прошло</b>\n\n"
+                f"<b>Пользователь:</b> {user_id}\n"
+                f"<b>Подписка:</b> {payload.product.title}\n"
+                f"<b>Причина:</b> {payload.errorMessage or 'не указана'}"
+            )
+
         # Обрабатываем неудачный платеж
         elif payload.eventType == "payment.failed":
             logger.info(
@@ -677,69 +734,7 @@ async def lava_webhook(request: Request, username: str = Depends(verify_credenti
         logger.error(f"Ошибка при обработке веб-хука: {str(e)}")
         return {"status": "error", "message": str(e)}
 
-@app.post("/admin/reset_db")
-async def reset_database(request: Request, username: str = Depends(verify_credentials)):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        # Удаляем все таблицы
-        cursor.execute("DROP TABLE IF EXISTS payments")
-        cursor.execute("DROP TABLE IF EXISTS channel_members")
-        
-        # Создаем таблицу payments
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_type TEXT NOT NULL,
-            product_id TEXT NOT NULL,
-            product_title TEXT NOT NULL,
-            buyer_email TEXT NOT NULL,
-            contract_id TEXT NOT NULL,
-            parent_contract_id TEXT,
-            amount REAL NOT NULL,
-            currency TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            status TEXT NOT NULL,
-            error_message TEXT,
-            raw_data TEXT NOT NULL,
-            received_at TEXT NOT NULL,
-            processed INTEGER DEFAULT 0
-        )
-        ''')
-        
-        # Создаем таблицу channel_members с обновленной структурой
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS channel_members (
-            user_id TEXT PRIMARY KEY,
-            status TEXT NOT NULL,
-            joined_at TEXT NOT NULL,
-            expires_at TEXT,
-            subscription_end_date TEXT,
-            last_payment_id INTEGER,
-            FOREIGN KEY (last_payment_id) REFERENCES payments(id)
-        )
-        ''')
-        
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS subscription_reminders (
-            user_id TEXT PRIMARY KEY,
-            last_reminder_at TEXT NOT NULL
-        )
-        ''')
-        
-        conn.commit()
-        conn.close()
-        
-        logger.info("База данных успешно сброшена администратором")
-        return {"status": "success", "message": "База данных успешно сброшена"}
-        
-    except Exception as e:
-        logger.error(f"Ошибка при сбросе базы данных: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+# Эндпоинт /admin/reset_db удалён 23.11.2026: одним запросом стирал всю базу подписчиков.
 
 @app.post("/shorten")
 async def shorten_url(request: ShortenLinkRequest, username: str = Depends(verify_credentials)):

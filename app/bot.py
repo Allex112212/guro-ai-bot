@@ -11,15 +11,15 @@ from datetime import datetime, timedelta, timezone
 import json
 
 # Настройка логирования
-DATA_DIR = Path("/mount/database")
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR = Path(os.getenv("DATA_DIR", "/mount/database"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 log_file = DATA_DIR / f"log_{time.strftime('%Y%m%d')}.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(log_file),
+        logging.FileHandler(log_file, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -90,37 +90,153 @@ def get_periodicity_by_amount(amount: float, currency: str = "RUB") -> str:
     if (currency, amount) in DYNAMIC_PRICE_MAP:
         return DYNAMIC_PRICE_MAP[(currency, amount)]
 
-    # 3. Фолбэк на старую логику для RUB (если карта пуста или API недоступно)
-    if currency == "RUB":
-        if amount in PRICE_PERIODICITY:
-            return PRICE_PERIODICITY[amount]
-        # Ищем ближайшую цену
-        closest_price = min(PRICE_PERIODICITY.keys(), key=lambda x: abs(x - amount))
-        if abs(closest_price - amount) <= closest_price * 0.1:
-            return PRICE_PERIODICITY[closest_price]
-            
+    # Старый фолбэк «ближайшая цена ±10 %» убран 23.11.2026: при цене 2 000 ₽/мес
+    # он давал 6 месяцев доступа (PRICE_6_MONTHS по умолчанию = 2000).
     logger.warning(f"Не удалось определить периодичность для {amount} {currency}, используем MONTHLY")
     return "MONTHLY"
 
+
+# ===== Период подписки: храним, какой период выбрал человек (23.11.2026) =====
+# Раньше срок доступа определялся только по сумме оплаты. Теперь порядок такой:
+# 1) период, сохранённый для договора Lava (contractId / parentContractId);
+# 2) точное совпадение суммы с ценой оффера в Lava;
+# 3) период, выбранный при создании ссылки (первая оплата)
+#    или подтверждённый период прошлой оплаты (продление);
+# 4) месяц.
+
+def _db():
+    return sqlite3.connect(DB_PATH)
+
+
+def ensure_extra_tables():
+    conn = _db()
+    try:
+        c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS contract_periodicity (
+            contract_id TEXT PRIMARY KEY, user_id TEXT, periodicity TEXT NOT NULL, created_at TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS user_periodicity (
+            user_id TEXT NOT NULL, kind TEXT NOT NULL, periodicity TEXT NOT NULL, updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, kind))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT)""")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def remember_pending_periodicity(user_id, periodicity, contract_id=None):
+    """Человек открыл ссылку на оплату — запоминаем выбранный период."""
+    if periodicity not in PERIOD_DAYS:
+        return
+    ensure_extra_tables()
+    conn = _db()
+    try:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO user_periodicity VALUES (?, 'pending', ?, ?)",
+                  (str(user_id), periodicity, _now_iso()))
+        if contract_id:
+            c.execute("INSERT OR REPLACE INTO contract_periodicity VALUES (?, ?, ?, ?)",
+                      (str(contract_id), str(user_id), periodicity, _now_iso()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def remember_confirmed_periodicity(user_id, periodicity, contract_ids=()):
+    """Оплата прошла — закрепляем период за человеком и договором."""
+    if periodicity not in PERIOD_DAYS:
+        return
+    ensure_extra_tables()
+    conn = _db()
+    try:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO user_periodicity VALUES (?, 'confirmed', ?, ?)",
+                  (str(user_id), periodicity, _now_iso()))
+        for cid in contract_ids:
+            if cid:
+                c.execute("INSERT OR REPLACE INTO contract_periodicity VALUES (?, ?, ?, ?)",
+                          (str(cid), str(user_id), periodicity, _now_iso()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _exact_amount_periodicity(amount, currency):
+    try:
+        key = (str(currency or "RUB").upper(), float(amount))
+    except (TypeError, ValueError):
+        return None
+    if key not in DYNAMIC_PRICE_MAP:
+        get_available_subscriptions()
+    return DYNAMIC_PRICE_MAP.get(key)
+
+
+def resolve_periodicity(user_id, amount, currency, contract_ids=(), recurring=False):
+    """Возвращает (periodicity, источник)."""
+    ensure_extra_tables()
+    conn = _db()
+    try:
+        c = conn.cursor()
+        for cid in contract_ids:
+            if not cid:
+                continue
+            row = c.execute("SELECT periodicity FROM contract_periodicity WHERE contract_id = ?",
+                            (str(cid),)).fetchone()
+            if row and row[0] in PERIOD_DAYS:
+                return row[0], "contract"
+        by_amount = _exact_amount_periodicity(amount, currency)
+        if by_amount in PERIOD_DAYS:
+            return by_amount, "amount"
+        kind = "confirmed" if recurring else "pending"
+        row = c.execute("SELECT periodicity FROM user_periodicity WHERE user_id = ? AND kind = ?",
+                        (str(user_id), kind)).fetchone()
+        if row and row[0] in PERIOD_DAYS:
+            return row[0], kind
+    finally:
+        conn.close()
+    logger.warning(f"Период для {user_id} ({amount} {currency}) не определён — берём месяц")
+    return "MONTHLY", "default"
+
+
+def get_setting(key, default=None):
+    ensure_extra_tables()
+    conn = _db()
+    try:
+        row = conn.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+    finally:
+        conn.close()
+
+
+def set_setting(key, value):
+    ensure_extra_tables()
+    conn = _db()
+    try:
+        conn.execute("INSERT OR REPLACE INTO bot_settings VALUES (?, ?)", (key, str(value)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def removals_paused():
+    """Переключатель «не удалять из канала» (на время сбоев Lava с банками)."""
+    return os.getenv("REMOVALS_PAUSED", "") == "1" or get_setting("removals_paused", "0") == "1"
+
 # В начале файла, где определяются другие константы
-default_message = """Добро пожаловать в канал с бурятскими мультфильмами и сериалами.
-"""
+default_message = """Привет! Это бот закрытого канала Студии Гуро.
+Нажимай кнопку ниже ⬇️"""
 
 # Получаем сообщение из переменной окружения или используем значение по умолчанию
 MAIN_MESSAGE = os.getenv("MAIN_MESSAGE", default_message).replace('\\n', '\n')
 
 # Получаем текст "О канале" из переменной окружения
-DEFAULT_ABOUT_TEXT = """В ЗАКРЫТОМ КАНАЛЕ:
-
-✅ Хиты на бурятском — «Шрек», «Кунг-фу Панда» и другие любимые мультфильмы. Мы постоянно пополняем коллекцию.
-
-✅ Вы — наш генеральный партнёр. Ваша подписка помогает создавать новые мультфильмы и фильмы на бурятском языке.
-
-Вместе мы создадим индустрию бурятского кино.
-Сделаем родной язык — модным, сильным и вечным."""
+DEFAULT_ABOUT_TEXT = """Закрытый канал Студии Гуро."""
 ABOUT_TEXT = os.getenv("ABOUT_TEXT", DEFAULT_ABOUT_TEXT).replace('\\n', '\n')
 
-PAYMENT_DOMAIN = os.getenv("PAYMENT_DOMAIN", "buryat-films.ru")
+PAYMENT_DOMAIN = os.getenv("PAYMENT_DOMAIN", "")
 INTERNAL_WEBHOOK_URL = os.getenv("INTERNAL_WEBHOOK_URL", "http://localhost:8000")
 
 # Обновляем словари для переводов
@@ -139,7 +255,8 @@ CURRENCY_TRANSLATIONS = {
 
 # Добавляем константы для настройки уведомлений
 GRACE_PERIOD_DAYS = 3  # Дней отсрочки после окончания подписки
-NOTIFY_BEFORE_DAYS = [7, 3, 1]  # За сколько дней уведомлять об окончании подписки
+NOTIFY_BEFORE_DAYS = [7, 3, 1]  # (старое, не используется)
+REMIND_BEFORE_DAYS = [3, 1]  # Напоминание тем, у кого автопродление выключено (23.11.2026)
 
 # Инициализация бота
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -1205,6 +1322,13 @@ def process_currency_callback(call):
         payment_url = payment_data.get('paymentUrl')
         if not payment_url:
             raise ValueError("В ответе отсутствует ссылка на оплату")
+
+        try:
+            remember_pending_periodicity(
+                user_id, periodicity,
+                payment_data.get('contractId') or payment_data.get('id'))
+        except Exception as e:
+            logger.error(f"Не удалось сохранить выбранный период для {user_id}: {e}")
         
         # Сокращаем ссылку
         short_payment_url = shorten_payment_url(payment_url)
@@ -1295,6 +1419,9 @@ def check_subscription_expiration():
         logger.debug(f"Найдено {len(members)} пользователей для проверки (active/cancelled)")
         
         current_time = datetime.now(timezone.utc)
+        paused = removals_paused()
+        if paused:
+            logger.warning("Удаление из канала на паузе (removals_paused) — никого не удаляем")
         removed_count = 0
         errors_count = 0
         
@@ -1336,7 +1463,7 @@ def check_subscription_expiration():
                 # - если подписка уже истекла и закончился льготный период, переводим в removed
                 # - если срок еще не истек, даем пользователю возможность вернуться в канал и не меняем статус
                 if not is_member and member_status in ['active', 'cancelled']:
-                    if has_expired and days_after_expiry >= GRACE_PERIOD_DAYS:
+                    if has_expired and days_after_expiry >= GRACE_PERIOD_DAYS and not paused:
                         # Обновляем статус только если он еще не 'removed'
                         cursor.execute('''
                         UPDATE channel_members 
@@ -1382,7 +1509,9 @@ def check_subscription_expiration():
                 
                 # Если пользователь в канале, проверяем срок подписки
                 if is_member:
-                    if has_expired:
+                    if has_expired and paused:
+                        logger.info(f"Пауза удалений: {user_id} остаётся в канале (подписка истекла {end_date_str})")
+                    elif has_expired:
                         if days_after_expiry >= GRACE_PERIOD_DAYS:
                             logger.info(
                                 f"Удаление пользователя {user_id} из канала: "
@@ -1461,14 +1590,27 @@ def check_subscription_expiration():
                                     logger.warning(f"Не удалось отправить напоминание пользователю {user_id}: {e}")
 
 
-                    # Уведомления о скором окончании подписки
-                    #elif days_left in NOTIFY_BEFORE_DAYS:
-                        #bot.send_message(
-                        #    user_id,
-                        #    f"ℹ️ Ваша подписка закончится через {days_left} дней.\n"
-                        #    f"Не забудьте продлить её, чтобы сохранить доступ к каналу.\n\n"
-                        #    f"Для продления используйте команду /subscribe"
-                        #)
+                    # Напоминание до окончания (23.11.2026): только тем, у кого автопродление
+                    # выключено (status = cancelled). У active Lava спишет сама — их не тревожим.
+                    elif member_status == 'cancelled' and days_left in REMIND_BEFORE_DAYS:
+                        cursor.execute('SELECT last_reminder_at FROM subscription_reminders WHERE user_id = ?', (user_id,))
+                        reminder_row = cursor.fetchone()
+                        if not reminder_row or reminder_row[0] != current_date_iso:
+                            cursor.execute('''
+                            INSERT INTO subscription_reminders (user_id, last_reminder_at)
+                            VALUES (?, ?)
+                            ON CONFLICT(user_id) DO UPDATE SET last_reminder_at=excluded.last_reminder_at
+                            ''', (user_id, current_date_iso))
+                            conn.commit()
+                            try:
+                                bot.send_message(
+                                    user_id,
+                                    f"ℹ️ Доступ к каналу закончится {end_date.strftime('%d.%m.%Y')}.\n"
+                                    "Автопродление у вас выключено.\n\n"
+                                    "Чтобы остаться, оформите подписку: /subscribe"
+                                )
+                            except Exception as e:
+                                logger.warning(f"Не удалось отправить напоминание до окончания {user_id}: {e}")
             
             except Exception as e:
                 logger.error(f"Ошибка при проверке пользователя {user_id}: {str(e)}", exc_info=True)
@@ -1729,6 +1871,86 @@ def get_offers_command(message):
     bot.send_message(message.chat.id, response, parse_mode="HTML")
 
 # Обработчик для команды /subscribe
+# ===== Команды администратора и защита данных (23.11.2026) =====
+
+def _is_admin(message):
+    return str(message.from_user.id) == str(ADMIN_ID)
+
+
+def send_db_backup(caption="Копия базы бота"):
+    """Отправляет файл базы админу в Telegram."""
+    if not ADMIN_ID:
+        return False
+    try:
+        if not DB_PATH.exists():
+            return False
+        stamp = datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M')
+        with open(DB_PATH, 'rb') as f:
+            bot.send_document(ADMIN_ID, f, caption=f"💾 {caption} ({stamp} UTC)",
+                              visible_file_name=f"backup_{stamp}.db")
+        set_setting("last_backup_at", _now_iso())
+        return True
+    except Exception as e:
+        logger.error(f"Не удалось отправить копию базы: {e}")
+        return False
+
+
+@bot.message_handler(commands=['removals_off'])
+def removals_off_command(message):
+    if not _is_admin(message):
+        return
+    set_setting("removals_paused", "1")
+    bot.reply_to(message, "⏸ Удаление из канала на паузе. Никого не удаляю, пока не включишь /removals_on")
+
+
+@bot.message_handler(commands=['removals_on'])
+def removals_on_command(message):
+    if not _is_admin(message):
+        return
+    set_setting("removals_paused", "0")
+    bot.reply_to(message, "▶️ Удаление из канала снова включено.")
+
+
+@bot.message_handler(commands=['backup'])
+def backup_command(message):
+    if not _is_admin(message):
+        return
+    if not send_db_backup("Копия базы по запросу"):
+        bot.reply_to(message, "Не получилось отправить копию базы, смотри логи.")
+
+
+@bot.message_handler(commands=['admin'])
+def admin_help_command(message):
+    if not _is_admin(message):
+        return
+    state = "на паузе ⏸" if removals_paused() else "включено ▶️"
+    bot.reply_to(
+        message,
+        "Команды для тебя:\n"
+        "/removals_off — поставить удаление из канала на паузу (если у Lava сбой)\n"
+        "/removals_on — снова включить удаление\n"
+        "/backup — прислать копию базы\n"
+        "/broadcast текст — рассылка\n\n"
+        f"Удаление из канала сейчас: {state}"
+    )
+
+
+def daily_backup_loop():
+    """Раз в сутки присылает админу копию базы."""
+    while True:
+        try:
+            last = get_setting("last_backup_at")
+            due = True
+            if last:
+                last_dt = datetime.fromisoformat(last)
+                due = datetime.now(timezone.utc) - last_dt >= timedelta(hours=24)
+            if due:
+                send_db_backup("Ежедневная копия базы")
+        except Exception as e:
+            logger.error(f"Ошибка в ежедневной копии базы: {e}")
+        time.sleep(3600)
+
+
 @bot.message_handler(commands=['subscribe'])
 def subscribe_command(message):
     # Правильно получаем ID пользователя
@@ -1830,6 +2052,14 @@ def run_bot():
     subscription_thread = threading.Thread(target=check_subscriptions_periodically)
     subscription_thread.daemon = True
     subscription_thread.start()
+
+    # Ежедневная копия базы админу (23.11.2026)
+    backup_thread = threading.Thread(target=daily_backup_loop)
+    backup_thread.daemon = True
+    backup_thread.start()
+
+    # Сообщение админу о запуске: если пришло неожиданно — бот перезапускался
+    notify_admin("🔄 Бот запущен. Команды: /admin")
     
     while True:
         try:
