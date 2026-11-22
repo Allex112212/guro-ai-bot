@@ -2150,6 +2150,17 @@ def run_bot():
     backup_thread.daemon = True
     backup_thread.start()
 
+    # Кнопка «Меню» со списком команд (23.11.2026). Админские команды сюда не входят.
+    try:
+        bot.set_my_commands([
+            types.BotCommand("start", "Запустить бота"),
+            types.BotCommand("subscribe", "Подписаться"),
+            types.BotCommand("status", "Статус подписки"),
+            types.BotCommand("link", "Ссылка в канал"),
+        ])
+    except Exception as e:
+        logger.warning(f"Не удалось выставить меню команд: {e}")
+
     # Сообщение админу о запуске: если пришло неожиданно — бот перезапускался
     notify_admin("🔄 Бот запущен. Команды: /admin")
     
