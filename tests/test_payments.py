@@ -39,7 +39,9 @@ def fake_get(url, params=None, headers=None, **kw):
     resp.raise_for_status = lambda: None
     resp.json = lambda: {"items": [{"type": "SUBSCRIPTION", "offers": [{
         "id": "offer-1", "name": "Клуб", "description": "",
-        "prices": [{"periodicity": p, "currency": "RUB", "amount": a} for p, a in LAVA_PRICES.items()],
+        "prices": [{"periodicity": p, "currency": "RUB", "amount": a} for p, a in LAVA_PRICES.items()]
+                  + [{"periodicity": "MONTHLY", "currency": "USD", "amount": 18},
+                     {"periodicity": "MONTHLY", "currency": "EUR", "amount": 16.5}],
     }]}]}
     return resp
 
@@ -318,6 +320,50 @@ check("active без продления: админу одно сообщени�
 # 23. /remove — ручное удаление админом
 B.remove_command(SimpleNamespace(from_user=SimpleNamespace(id=111), chat=SimpleNamespace(id=111), text="/remove u9"))
 check("/remove удаляет", MEMBERS["u9"] == "kicked" and member("u9")[0] == "removed")
+
+# 24. Меню оплаты: «Карта РФ» / «Зарубежная карта», без цен на первом шаге
+EDITS = []
+B.bot.edit_message_text = lambda text, *a, **kw: EDITS.append((text, kw.get("reply_markup")))
+B.bot.answer_callback_query = lambda *a, **kw: None
+B.PAYMENT_DOMAIN = ""
+B._SUBS_CACHE["data"] = None
+msg = SimpleNamespace(chat=SimpleNamespace(id="u10"), message_id=1)
+call = SimpleNamespace(id="c", from_user=SimpleNamespace(id="u10"), message=msg, data="show_subscribe")
+EDITS.clear()
+B.show_subscription_menu(msg, call=call)
+kb = EDITS[-1][1].keyboard
+labels = [b.text for row in kb for b in row]
+check("меню: «Карта РФ» и «Зарубежная карта» без цен",
+      "💳 Карта РФ" in labels and "🌍 Зарубежная карта" in labels and not any("₽" in l for l in labels), labels)
+
+# 25. Карта РФ → сразу кнопки-ссылки на Lava в рублях
+EDITS.clear()
+B.process_pay_method_callback(SimpleNamespace(id="c", from_user=SimpleNamespace(id="u10"), message=msg, data="pay|RUB"))
+kb = EDITS[-1][1].keyboard
+rub = [(b.text, b.url) for row in kb for b in row if b.url]
+check("Карта РФ → «1 месяц — 2 000 ₽» ведёт прямо на Lava",
+      any(t == "1 месяц — 2 000 ₽" and u.startswith("https://app.lava.top") for t, u in rub)
+      and not any("$" in t or "€" in t for t, _ in rub), rub)
+
+# 26. Зарубежная карта → доллары и евро, без рублей
+EDITS.clear()
+B.process_pay_method_callback(SimpleNamespace(id="c", from_user=SimpleNamespace(id="u10"), message=msg, data="pay|FX"))
+kb = EDITS[-1][1].keyboard
+fx = [b.text for row in kb for b in row if b.url]
+check("Зарубежная карта → $ и €, без ₽", any("$" in t for t in fx) and any("€" in t for t in fx)
+      and not any("₽" in t for t in fx), fx)
+
+# 27. Цены запоминаются: второе открытие меню не ходит в Lava
+calls = {"n": 0}
+_orig_fetch = B._fetch_available_subscriptions
+def _counting_fetch():
+    calls["n"] += 1
+    return _orig_fetch()
+B._fetch_available_subscriptions = _counting_fetch
+B._SUBS_CACHE["data"] = None
+B.get_available_subscriptions(); B.get_available_subscriptions(); B.get_available_subscriptions()
+B._fetch_available_subscriptions = _orig_fetch
+check("цены из Lava запоминаются (1 запрос на 3 открытия)", calls["n"] == 1, calls["n"])
 
 # 19. /shorten принимает только ссылки Lava
 r = client.post("/shorten", auth=AUTH, json={"original_url": "https://evil.example/x"})

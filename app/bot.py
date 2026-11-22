@@ -85,7 +85,7 @@ def get_periodicity_by_amount(amount: float, currency: str = "RUB") -> str:
     
     # 2. Если в карте нет (например, бот только запустился), пробуем обновить карту
     logger.info(f"Цена {amount} {currency} не найдена в карте, обновляем данные из API...")
-    get_available_subscriptions()
+    get_available_subscriptions(force=True)
     
     if (currency, amount) in DYNAMIC_PRICE_MAP:
         return DYNAMIC_PRICE_MAP[(currency, amount)]
@@ -170,7 +170,7 @@ def _exact_amount_periodicity(amount, currency):
     except (TypeError, ValueError):
         return None
     if key not in DYNAMIC_PRICE_MAP:
-        get_available_subscriptions()
+        get_available_subscriptions(force=True)  # цену могли поменять — спрашиваем Lava заново
     return DYNAMIC_PRICE_MAP.get(key)
 
 
@@ -263,7 +263,22 @@ bot = telebot.TeleBot(BOT_TOKEN)
 
 
 # Функция для получения списка доступных подписок
-def get_available_subscriptions():
+_SUBS_CACHE = {"at": 0.0, "data": None}
+SUBS_CACHE_SECONDS = 300
+
+
+def get_available_subscriptions(force=False):
+    """Цены из Lava с запоминанием на 5 минут — меню открывается быстрее (23.11.2026)."""
+    now = time.time()
+    if not force and _SUBS_CACHE["data"] and now - _SUBS_CACHE["at"] < SUBS_CACHE_SECONDS:
+        return _SUBS_CACHE["data"]
+    data = _fetch_available_subscriptions()
+    if data:
+        _SUBS_CACHE["data"], _SUBS_CACHE["at"] = data, now
+    return data or _SUBS_CACHE["data"]
+
+
+def _fetch_available_subscriptions():
     global DYNAMIC_PRICE_MAP
     url = "https://gate.lava.top/api/v2/products"
     params = {
@@ -743,7 +758,32 @@ def show_subscription_menu(message, call=None):
             logger.error(f"Ошибка при отображении ошибки подписок: {e}")
         return
 
-    # Для каждой подписки создаем отдельное сообщение с кнопками периодов
+    # Новый путь (23.11.2026): сначала способ оплаты — «Карта РФ» / «Зарубежная карта»,
+    # потом сразу кнопка-ссылка на Lava. Старое меню периодов ниже оставлено как запасное.
+    sub = subscriptions[0]
+    currencies = set()
+    for price in sub["prices"]:
+        currencies.update(price["currencies"].keys())
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if "RUB" in currencies:
+        markup.add(types.InlineKeyboardButton("💳 Карта РФ", callback_data="pay|RUB"))
+    if currencies & {"USD", "EUR"}:
+        markup.add(types.InlineKeyboardButton("🌍 Зарубежная карта", callback_data="pay|FX"))
+    markup.add(types.InlineKeyboardButton('🔙 Главное меню', callback_data='show_menu'))
+    message_text = f"<b>{sub['name']}</b>\n\n{sub['description']}\n\nКакой картой будете оплачивать?"
+    try:
+        if call:
+            bot.edit_message_text(message_text, chat_id=call.message.chat.id,
+                                  message_id=call.message.message_id,
+                                  reply_markup=markup, parse_mode="HTML")
+        else:
+            bot.send_message(message.chat.id, message_text, reply_markup=markup, parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"Не удалось отредактировать сообщение, отправляем новое: {e}")
+        bot.send_message(message.chat.id, message_text, reply_markup=markup, parse_mode="HTML")
+    return
+
+    # Для каждой подписки создаем отдельное сообщение с кнопками периодов (старый путь)
     for sub in subscriptions:
         markup = types.InlineKeyboardMarkup(row_width=1)
 
@@ -1178,7 +1218,76 @@ def process_main_menu(call):
         logger.error(f"Ошибка при обработке кнопки меню: {str(e)}")
         bot.answer_callback_query(call.id, "Произошла ошибка. Попробуйте позже.")
 
-# Обработчик для выбора периода оплаты
+def _fmt_amount(amount):
+    """1500.0 → «1 500», 18.5 → «18.5»."""
+    try:
+        a = float(amount)
+    except (TypeError, ValueError):
+        return str(amount)
+    if a.is_integer():
+        return f"{int(a):,}".replace(",", " ")
+    return f"{a:.2f}".rstrip("0").rstrip(".")
+
+
+# Способ оплаты → сразу кнопки-ссылки на Lava (23.11.2026)
+@bot.callback_query_handler(func=lambda call: call.data.startswith('pay|'))
+def process_pay_method_callback(call):
+    user_id = call.from_user.id
+    method = call.data.split('|', 1)[1]
+    wanted = ["RUB"] if method == "RUB" else ["USD", "EUR"]
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    try:
+        bot.edit_message_text("⏳ Готовлю ссылку на оплату…", call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    try:
+        subscriptions = get_available_subscriptions()
+        if not subscriptions:
+            raise ValueError("Нет подписок")
+        sub = subscriptions[0]
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        made = 0
+        for price in sub["prices"]:
+            periodicity = price["periodicity"]
+            period_text = PERIOD_TRANSLATIONS.get(periodicity, periodicity)
+            for cur in wanted:
+                amount = price["currencies"].get(cur)
+                if amount is None:
+                    continue
+                data = create_payment_link(user_id, sub["offer_id"], periodicity, cur)
+                url = (data or {}).get("paymentUrl")
+                if not url:
+                    continue
+                try:
+                    remember_pending_periodicity(user_id, periodicity,
+                                                 data.get("contractId") or data.get("id"))
+                except Exception as e:
+                    logger.error(f"Не удалось сохранить выбранный период для {user_id}: {e}")
+                symbol = CURRENCY_TRANSLATIONS.get(cur, cur)
+                label = f"{period_text} — {_fmt_amount(amount)} {symbol}"
+                markup.add(types.InlineKeyboardButton(label, url=shorten_payment_url(url)))
+                made += 1
+        if not made:
+            raise ValueError("Не удалось создать ни одной ссылки")
+        markup.add(types.InlineKeyboardButton('← Назад', callback_data='show_subscribe'))
+        bot.edit_message_text("Нажмите, чтобы перейти к оплате:", call.message.chat.id,
+                              call.message.message_id, reply_markup=markup)
+    except Exception as e:
+        logger.error(f"Ошибка при создании ссылки на оплату ({method}) для {user_id}: {e}", exc_info=True)
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(types.InlineKeyboardButton('← Назад', callback_data='show_subscribe'))
+        try:
+            bot.edit_message_text("Не получилось подготовить оплату. Попробуйте ещё раз через минуту "
+                                  "или напишите в поддержку.", call.message.chat.id,
+                                  call.message.message_id, reply_markup=markup)
+        except Exception:
+            pass
+
+
+# Обработчик для выбора периода оплаты (старый путь, оставлен для старых сообщений)
 @bot.callback_query_handler(func=lambda call: call.data.startswith('p|'))
 def process_payment_callback(call):
     try:
@@ -2169,7 +2278,8 @@ def run_bot():
             # Запускаем бота с увеличенными таймаутами
             # interval=3: увеличиваем интервал между запросами
             # timeout=30: увеличиваем таймаут соединения
-            bot.polling(none_stop=True, interval=3, timeout=30)
+            # interval=0: без 3-секундной паузы между опросами — бот отвечает сразу (23.11.2026)
+            bot.polling(none_stop=True, interval=0, timeout=30)
         except requests.exceptions.ReadTimeout as e:
             logger.warning(f"Таймаут при обращении к Telegram API: {str(e)}. Перезапуск бота через 5 секунд...")
             time.sleep(5)
