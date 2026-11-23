@@ -243,6 +243,13 @@ if not OFFER_URL and PAYMENT_DOMAIN and (Path(__file__).parent / "offer.html").e
     OFFER_URL = f"https://{PAYMENT_DOMAIN}/offer"
 INTERNAL_WEBHOOK_URL = os.getenv("INTERNAL_WEBHOOK_URL", "http://localhost:8000")
 
+
+def _offer_note():
+    """Строка про оферту под экранами оплаты (пусто, если оферты нет)."""
+    if not OFFER_URL:
+        return ""
+    return f'\n\n<i>Оплачивая подписку, вы принимаете <a href="{OFFER_URL}">условия оферты</a>.</i>'
+
 # Обновляем словари для переводов
 PERIOD_TRANSLATIONS = {
     "MONTHLY": "1 месяц",
@@ -779,18 +786,20 @@ def show_subscription_menu(message, call=None):
         markup.add(types.InlineKeyboardButton("💳 Карта РФ", callback_data="pay|RUB"))
     if currencies & {"USD", "EUR"}:
         markup.add(types.InlineKeyboardButton("🌍 Зарубежная карта", callback_data="pay|FX"))
+    if OFFER_URL:
+        markup.add(types.InlineKeyboardButton('📋 Оферта', url=OFFER_URL))
     markup.add(types.InlineKeyboardButton('← Меню', callback_data='show_menu'))
-    message_text = f"<b>{sub['name']}</b>\n\n{sub['description']}\n\nВыберите, пожалуйста, карту:"
+    message_text = f"<b>{sub['name']}</b>\n\n{sub['description']}\n\nВыберите, пожалуйста, карту:{_offer_note()}"
     try:
         if call:
             bot.edit_message_text(message_text, chat_id=call.message.chat.id,
                                   message_id=call.message.message_id,
-                                  reply_markup=markup, parse_mode="HTML")
+                                  reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
         else:
-            bot.send_message(message.chat.id, message_text, reply_markup=markup, parse_mode="HTML")
+            bot.send_message(message.chat.id, message_text, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.warning(f"Не удалось отредактировать сообщение, отправляем новое: {e}")
-        bot.send_message(message.chat.id, message_text, reply_markup=markup, parse_mode="HTML")
+        bot.send_message(message.chat.id, message_text, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
     return
 
     # Для каждой подписки создаем отдельное сообщение с кнопками периодов (старый путь)
@@ -1283,8 +1292,9 @@ def process_pay_method_callback(call):
         if not made:
             raise ValueError("Не удалось создать ни одной ссылки")
         markup.add(types.InlineKeyboardButton('← Назад', callback_data='show_subscribe'))
-        bot.edit_message_text("Нажми, откроется страница оплаты:", call.message.chat.id,
-                              call.message.message_id, reply_markup=markup)
+        bot.edit_message_text("Нажми, откроется страница оплаты:" + _offer_note(), call.message.chat.id,
+                              call.message.message_id, reply_markup=markup,
+                              parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Ошибка при создании ссылки на оплату ({method}) для {user_id}: {e}", exc_info=True)
         markup = types.InlineKeyboardMarkup(row_width=1)
