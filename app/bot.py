@@ -891,9 +891,6 @@ def show_main_menu(message):
         if btn_support: # Добавляем кнопку поддержки, если она была создана
             markup.add(btn_support)
         
-    # Оферта (23.11.2026): кнопка появляется, когда в настройках задан OFFER_URL
-    if OFFER_URL:
-        markup.add(types.InlineKeyboardButton('📋 Оферта', url=OFFER_URL))
 
     # Отправляем меню отдельным сообщением
     try:
