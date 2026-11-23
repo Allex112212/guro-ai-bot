@@ -2235,6 +2235,46 @@ def backup_command(message):
         bot.reply_to(message, "Не получилось отправить копию базы, смотри логи.")
 
 
+@bot.message_handler(commands=['export'])
+def export_members_command(message):
+    """Запасной план: список участников в CSV (если бот заблокируют, есть кому выдать доступ вручную)."""
+    if not _is_admin(message):
+        return
+    import csv, io
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT cm.user_id, cm.status, cm.subscription_end_date, "
+            "(SELECT COALESCE(p.parent_contract_id, p.contract_id) FROM payments p "
+            " WHERE p.buyer_email = cm.user_id || '@t.me' ORDER BY p.timestamp DESC LIMIT 1) "
+            "FROM channel_members cm ORDER BY cm.subscription_end_date DESC").fetchall()
+        conn.close()
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["telegram_id", "status", "subscription_end_date", "lava_contract_id"])
+        w.writerows(rows)
+        data = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
+        data.name = f"members_{datetime.now().strftime('%Y-%m-%d')}.csv"
+        bot.send_document(message.chat.id, data, caption=f"Участники: {len(rows)}")
+    except Exception as e:
+        logger.error(f"/export не получился: {e}", exc_info=True)
+        bot.reply_to(message, "Не получилось выгрузить список, смотри логи.")
+
+
+@bot.message_handler(commands=['refresh_prices'])
+def refresh_prices_command(message):
+    """После смены цены в Lava: сразу подтянуть новые цены, не ждать 5 минут."""
+    if not _is_admin(message):
+        return
+    subs = get_available_subscriptions(force=True)
+    prices = []
+    for sub in subs or []:
+        for pr in sub.get("prices", []):
+            for cur, amount in pr.get("currencies", {}).items():
+                prices.append(f"{cur} {amount}")
+    bot.reply_to(message, "Цены обновлены: " + (", ".join(prices) if prices else "Lava не ответила, попробуй ещё раз"))
+
+
 @bot.message_handler(commands=['admin'])
 def admin_help_command(message):
     if not _is_admin(message):
@@ -2246,6 +2286,8 @@ def admin_help_command(message):
         "/removals_off — поставить удаление из канала на паузу (если у Lava сбой)\n"
         "/removals_on — снова включить удаление\n"
         "/backup — прислать копию базы\n"
+        "/export — список участников в CSV (запасной план)\n"
+        "/refresh_prices — сразу подтянуть новую цену после смены в Lava\n"
         "/remove ID — удалить человека из канала вручную\n"
         "/broadcast текст — рассылка\n\n"
         f"Удаление из канала сейчас: {state}"

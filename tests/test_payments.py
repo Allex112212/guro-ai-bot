@@ -420,6 +420,13 @@ if _had:
 else:
     _offer.unlink()
 
+# --- запасной план: выгрузка участников ---
+SENT.clear()
+B.export_members_command(stranger)
+check("/export чужому не работает", not any("DOC:" in t for _, t in SENT))
+B.export_members_command(admin_msg)
+check("/export присылает CSV админу", any(c == "111" and t.startswith("DOC:Участники:") for c, t in SENT), SENT[-1:] if SENT else "")
+
 ok = sum(1 for _, passed, _ in RESULTS if passed)
 for name, passed, detail in RESULTS:
     print(("OK   " if passed else "FAIL ") + name + (f"  [{detail}]" if detail != "" else ""))
