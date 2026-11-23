@@ -237,7 +237,10 @@ DEFAULT_ABOUT_TEXT = """Закрытый канал Студии Гуро."""
 ABOUT_TEXT = os.getenv("ABOUT_TEXT", DEFAULT_ABOUT_TEXT).replace('\\n', '\n')
 
 PAYMENT_DOMAIN = os.getenv("PAYMENT_DOMAIN", "")
-OFFER_URL = os.getenv("OFFER_URL", "")  # ссылка на оферту (telegra.ph)
+OFFER_URL = os.getenv("OFFER_URL", "")  # своя ссылка на оферту, если задана
+# Иначе — страница /offer на нашем же сервере (файл app/offer.html), если он есть
+if not OFFER_URL and PAYMENT_DOMAIN and (Path(__file__).parent / "offer.html").exists():
+    OFFER_URL = f"https://{PAYMENT_DOMAIN}/offer"
 INTERNAL_WEBHOOK_URL = os.getenv("INTERNAL_WEBHOOK_URL", "http://localhost:8000")
 
 # Обновляем словари для переводов

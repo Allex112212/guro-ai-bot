@@ -11,7 +11,7 @@ import secrets
 import sqlite3
 import json
 from pydantic import BaseModel
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, HTMLResponse
 import hashlib
 import base64
 import time
@@ -355,6 +355,15 @@ async def startup_event():
 @app.get("/")
 async def root(_: str = Depends(verify_credentials)):
     return {"status": "ok", "message": "Lava.top webhook service is running"}
+
+OFFER_FILE = Path(__file__).parent / "offer.html"
+
+@app.get("/offer", response_class=HTMLResponse)
+async def offer_page():
+    """Публичная оферта клуба (без пароля)."""
+    if not OFFER_FILE.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+    return HTMLResponse(OFFER_FILE.read_text(encoding="utf-8"))
 
 @app.post("/lava/payment")
 async def lava_webhook(request: Request, username: str = Depends(verify_credentials)):

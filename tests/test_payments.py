@@ -404,6 +404,22 @@ check("отзыв словами сохранён, команда — нет", t
 
 client.__exit__(None, None, None)
 
+# --- оферта на своём сервере ---
+_offer = M.OFFER_FILE
+_had = _offer.exists()
+_backup = _offer.read_text(encoding="utf-8") if _had else None
+if _had:
+    _offer.unlink()
+r = client.get("/offer")
+check("/offer без файла — 404", r.status_code == 404, r.status_code)
+_offer.write_text("<h1>Оферта тест</h1>", encoding="utf-8")
+r = client.get("/offer")
+check("/offer открывается без пароля", r.status_code == 200 and "Оферта тест" in r.text, r.status_code)
+if _had:
+    _offer.write_text(_backup, encoding="utf-8")
+else:
+    _offer.unlink()
+
 ok = sum(1 for _, passed, _ in RESULTS if passed)
 for name, passed, detail in RESULTS:
     print(("OK   " if passed else "FAIL ") + name + (f"  [{detail}]" if detail != "" else ""))
