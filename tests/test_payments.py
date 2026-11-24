@@ -336,6 +336,10 @@ with mock.patch.object(B, "create_payment_link", wraps=B.create_payment_link) as
     rub = next(b for b in buttons if b.callback_data and b.callback_data.startswith("quote|RUB"))
     check("Тариф и сумма до создания счёта", "1 месяц" in text and "2 000 ₽" in rub.text and not create.called)
 
+    labels = [b.text for b in buttons]
+    check("Исходные значки и оферта", rub.text.startswith("💳 Карта РФ") and "🌍 Зарубежная карта" in labels
+          and "📋 Оферта" in labels)
+    check("Отмена только в приветствии", B.MAIN_MESSAGE.count(B.CANCEL_NOTE) == 1 and B.CANCEL_NOTE not in B.ABOUT_TEXT)
     call.data = "pay|FX"
     B.process_pay_method_callback(call)
     choices = [row[0] for row in EDITS[-1][1].keyboard if (row[0].callback_data or "").startswith("quote|")]
@@ -374,6 +378,9 @@ with mock.patch.object(B, "create_payment_link", wraps=B.create_payment_link) as
     finally:
         LAVA_PRICES["MONTHLY"] = 2000
         B.get_available_subscriptions(force=True)
+
+check("Экраны оплаты без повторов", all(B.CANCEL_NOTE not in text and "принимаешь" not in text
+      and "автоматически" not in text for text, _ in EDITS))
 
 # Статистика использует реальные обработчики, Telegram и Lava остаются заглушками.
 observe = next(h["function"] for h in B.bot.message_handlers if h["function"].__name__ == "observe_message")

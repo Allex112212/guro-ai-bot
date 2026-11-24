@@ -236,7 +236,7 @@ ABOUT_TEXT = os.getenv("STUDIO_CHANNEL_TEXT") or (
     "Открываю проект, делюсь промптами и референсами, сравниваю дубли и объясняю решения по монтажу и звуку."
 )
 MAIN_MESSAGE = MAIN_MESSAGE.replace(r"\n", "\n").strip() + "\n\n" + CANCEL_NOTE
-ABOUT_TEXT = ABOUT_TEXT.replace(r"\n", "\n").strip() + "\n\n" + CANCEL_NOTE
+ABOUT_TEXT = ABOUT_TEXT.replace(r"\n", "\n").strip()
 
 
 PAYMENT_DOMAIN = os.getenv("PAYMENT_DOMAIN", "")
@@ -246,12 +246,6 @@ if not OFFER_URL and PAYMENT_DOMAIN and (Path(__file__).parent / "offer.html").e
     OFFER_URL = f"https://{PAYMENT_DOMAIN}/offer"
 INTERNAL_WEBHOOK_URL = os.getenv("INTERNAL_WEBHOOK_URL", "http://localhost:8000")
 
-
-def _offer_note():
-    """Строка про оферту под экранами оплаты (пусто, если оферты нет)."""
-    if not OFFER_URL:
-        return ""
-    return f'\n\n<i>Оплачивая подписку, вы принимаете <a href="{OFFER_URL}">условия оферты</a>.</i>'
 
 # Обновляем словари для переводов
 PERIOD_TRANSLATIONS = {
@@ -779,19 +773,18 @@ def show_subscription_menu(message, call=None, foreign=False):
                 markup.add(currency_button(currency, prices[currency], "1 месяц · "))
     else:
         if "RUB" in prices:
-            markup.add(currency_button("RUB", prices["RUB"], "Карта РФ · "))
+            markup.add(currency_button("RUB", prices["RUB"], "💳 Карта РФ · "))
         if any(currency in prices for currency in ("USD", "EUR")):
-            markup.add(types.InlineKeyboardButton("Зарубежная карта", callback_data="pay|FX"))
+            markup.add(types.InlineKeyboardButton("🌍 Зарубежная карта", callback_data="pay|FX"))
     if markup.keyboard:
-        text = "Ночная смена · 1 месяц. Подписка продлевается автоматически."
+        text = "Ночная смена · 1 месяц"
         text += "\nВыбери валюту оплаты." if foreign else "\nВыбери способ оплаты."
         if OFFER_URL:
-            markup.add(types.InlineKeyboardButton("Условия подписки", url=OFFER_URL))
-            text += "\nОплачивая подписку, ты принимаешь условия оферты."
+            markup.add(types.InlineKeyboardButton("📋 Оферта", url=OFFER_URL))
     else:
         text = "Не удалось получить месячный тариф. Попробуй позже."
     markup.add(types.InlineKeyboardButton("← Назад", callback_data="show_subscribe" if foreign else "show_menu"))
-    render_checkout(message, call, text + "\n\n" + CANCEL_NOTE, markup)
+    render_checkout(message, call, text, markup)
 
 
 # Функция для показа главного меню
@@ -1221,7 +1214,7 @@ def prepare_checkout(call, key):
         _, currency, quoted = call.data.split("|")
         if currency not in ("RUB", "USD", "EUR"):
             return
-        bot.edit_message_text("Секунду, готовлю ссылку на оплату…", call.message.chat.id,
+        bot.edit_message_text("⏳ Секунду, готовлю ссылку на оплату…", call.message.chat.id,
                               call.message.message_id)
         subscriptions = get_available_subscriptions(force=True)
         if not subscriptions:
@@ -1251,14 +1244,14 @@ def prepare_checkout(call, key):
         label = f"Оплатить {_fmt_amount(amount)} {CURRENCY_TRANSLATIONS.get(currency, currency)}"
         markup.add(types.InlineKeyboardButton(label, url=url))
         if OFFER_URL:
-            markup.add(types.InlineKeyboardButton("Условия подписки", url=OFFER_URL))
-        text = "Ночная смена · 1 месяц. Подписка продлевается автоматически."
+            markup.add(types.InlineKeyboardButton("📋 Оферта", url=OFFER_URL))
+        text = "Ночная смена · 1 месяц"
     except Exception:
         logger.exception("Не удалось подготовить ссылку для подтверждённого тарифа")
         markup = types.InlineKeyboardMarkup(row_width=1)
         text = "Не удалось подготовить ссылку. Вернись к тарифу и попробуй ещё раз."
     markup.add(types.InlineKeyboardButton("← К тарифу", callback_data="show_subscribe"))
-    render_checkout(call.message, call, text + "\n\n" + CANCEL_NOTE, markup)
+    render_checkout(call.message, call, text, markup)
 
 
 # Добавляем новую функцию для сокращения ссылки
