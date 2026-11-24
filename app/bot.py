@@ -749,6 +749,17 @@ def currency_button(currency, amount, title):
                                       callback_data=f"quote|{currency}|{amount}")
 
 
+def edit_card(message, text, reply_markup=None):
+    if reply_markup is None:
+        reply_markup = types.InlineKeyboardMarkup()
+        reply_markup.add(types.InlineKeyboardButton("← Меню", callback_data="show_menu"))
+    try:
+        return bot.edit_message_text(text, message.chat.id, message.message_id, reply_markup=reply_markup)
+    except apihelper.ApiTelegramException as exc:
+        if exc.error_code != 400 or "message is not modified" not in exc.description.lower():
+            raise
+
+
 def show_subscription_menu(message, foreign=False, edit=False):
     subscriptions = get_available_subscriptions()
     prices = monthly_prices(subscriptions[0]) if subscriptions else {}
@@ -777,16 +788,16 @@ def show_subscription_menu(message, foreign=False, edit=False):
             markup.add(types.InlineKeyboardButton("📋 Оферта", url=OFFER_URL))
     else:
         text = "Не удалось получить месячный тариф. Попробуйте позже."
-    if foreign or not prices:
-        markup.add(types.InlineKeyboardButton("← Назад", callback_data="checkout_back" if foreign else "show_menu"))
+    markup.add(types.InlineKeyboardButton("← Назад" if foreign else "← Меню",
+                                         callback_data="checkout_back" if foreign else "show_menu"))
     if edit:
-        bot.edit_message_text(text, message.chat.id, message.message_id, reply_markup=markup)
+        edit_card(message, text, markup)
     else:
         bot.send_message(message.chat.id, text, reply_markup=markup)
 
 
 # Функция для показа главного меню
-def show_main_menu(message, text="Меню подписчика"):
+def show_main_menu(message, text=MAIN_MESSAGE, edit=False):
     markup = types.InlineKeyboardMarkup(row_width=1)
     
     # Проверяем статус подписки для определения доступных кнопок
@@ -825,16 +836,12 @@ def show_main_menu(message, text="Меню подписчика"):
             markup.add(btn_support)
         
 
-    # Отправляем меню отдельным сообщением
-    try:
-        bot.send_message( # Используем send_message для надежности
-            message.chat.id,
-            text,
-            reply_markup=markup,
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"Ошибка при отправке главного меню пользователю {message.chat.id}: {str(e)}")
+    if edit:
+        bot.edit_message_text(text, message.chat.id, message.message_id, reply_markup=markup, parse_mode="HTML")
+    else:
+        bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+
+
 # Обработчик для кнопки отмены подписки
 @bot.callback_query_handler(func=lambda call: call.data.startswith('cancel_'))
 def cancel_subscription_callback(call):
@@ -848,8 +855,8 @@ def cancel_subscription_callback(call):
                 call.id,
                 f"❌ Произошла ошибка при проверке статуса подписки: {subscription.get('error', 'Неизвестная ошибка')}. Попробуйте позже."
             )
-            bot.send_message(
-                call.message.chat.id,
+            edit_card(
+                call.message,
                 f"❌ Произошла ошибка при проверке статуса подписки: {subscription.get('error', 'Неизвестная ошибка')}. "
                 f"Пожалуйста, попробуйте позже или обратитесь в поддержку."
             )
@@ -865,8 +872,8 @@ def cancel_subscription_callback(call):
                 call.id,
                 "❌ Некорректные данные для отмены подписки. Пожалуйста, обратитесь в поддержку."
             )
-            bot.send_message(
-                call.message.chat.id,
+            edit_card(
+                call.message,
                 "❌ Произошла ошибка при отмене подписки. Не удалось распознать данные. Пожалуйста, обратитесь в поддержку."
             )
             return
@@ -889,8 +896,8 @@ def cancel_subscription_callback(call):
                     call.id,
                     "❌ Не удалось найти данные для отмены подписки. Пожалуйста, обратитесь в поддержку."
                 )
-                bot.send_message(
-                    call.message.chat.id,
+                edit_card(
+                    call.message,
                     "❌ Не удалось найти данные для отмены подписки. "
                     "Пожалуйста, попробуйте позже или обратитесь в поддержку."
                 )
@@ -903,15 +910,10 @@ def cancel_subscription_callback(call):
                                                 callback_data='show_status')
             markup.add(btn_confirm, btn_back)
             
-            try:
-                # Удаляем предыдущее сообщение с меню
-                bot.delete_message(call.message.chat.id, call.message.message_id)
-            except apihelper.ApiTelegramException as e:
-                logger.warning(f"Не удалось удалить сообщение {call.message.message_id} в чате {call.message.chat.id}: {e}")
             
             # Отправляем запрос подтверждения
-            bot.send_message(
-                call.message.chat.id,
+            edit_card(
+                call.message,
                 f"Выключить автопродление?\n\n"
                 f"Доступ останется до {end_date_str}, новых списаний не будет.",
                 reply_markup=markup
@@ -925,8 +927,8 @@ def cancel_subscription_callback(call):
                     call.id,
                     "❌ Не удалось отменить подписку: отсутствуют данные контракта."
                 )
-                bot.send_message(
-                    call.message.chat.id,
+                edit_card(
+                    call.message,
                     "❌ Произошла ошибка при отмене подписки: отсутствуют данные контракта. Пожалуйста, обратитесь в поддержку."
                 )
                 return
@@ -944,19 +946,13 @@ def cancel_subscription_callback(call):
                     end_date_str = "не определена"
                     logger.warning(f"end_date не найдена в subscription после успешной отмены для user {user_id}")
                 
-                try:
-                    # Удаляем предыдущее сообщение с меню
-                    bot.delete_message(call.message.chat.id, call.message.message_id)
-                except apihelper.ApiTelegramException as e:
-                    logger.warning(f"Не удалось удалить сообщение {call.message.message_id} в чате {call.message.chat.id} после отмены: {e}")
                 
                 # Сообщение об отмене + необязательный вопрос «что не понравилось» (23.11.2026)
-                bot.send_message(
-                    call.message.chat.id,
+                ask_feedback(
+                    call.message,
                     f"Готово, автопродление выключено. Вы в клубе до {end_date_str}.\n"
                     f"Если решите вернуться, всё будет здесь: /subscribe"
                 )
-                ask_feedback(call.message.chat.id)
                 
                 # Уведомление админу будет отправлено при получении webhook от Lava.top
                 # с актуальной датой окончания подписки (willExpireAt)
@@ -977,11 +973,7 @@ def cancel_subscription_callback(call):
 # Обработчик для кнопки "Подробнее о канале"
 @bot.callback_query_handler(func=lambda call: call.data == 'show_about')
 def show_about_callback(call):
-    try:
-        # Удаляем предыдущее сообщение с меню
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except apihelper.ApiTelegramException as e:
-        logger.warning(f"Не удалось удалить сообщение {call.message.message_id} в чате {call.message.chat.id}: {e}")
+    bot.answer_callback_query(call.id)
     
     # Проверяем статус подписки
     subscription = check_subscription_status(call.from_user.id)
@@ -997,9 +989,8 @@ def show_about_callback(call):
     btn_back = types.InlineKeyboardButton('← Меню', callback_data='show_menu')
     markup.add(btn_back)
     
-    # Отправляем меню отдельным сообщением
-    bot.send_message(
-        call.message.chat.id,
+    edit_card(
+        call.message,
         ABOUT_TEXT,
         reply_markup=markup
     )
@@ -1007,12 +998,8 @@ def show_about_callback(call):
 # Обработчик для кнопки "Статус подписки"
 @bot.callback_query_handler(func=lambda call: call.data == 'show_status')
 def show_status_callback(call):
+    bot.answer_callback_query(call.id)
     try:
-        try:
-            # Удаляем предыдущее сообщение с меню
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except apihelper.ApiTelegramException as e:
-            logger.warning(f"Не удалось удалить сообщение {call.message.message_id} в чате {call.message.chat.id}: {e}")
         
         user_id = call.from_user.id
         all_subs = get_all_user_subscriptions(user_id)
@@ -1068,8 +1055,8 @@ def show_status_callback(call):
                 btn_menu = types.InlineKeyboardButton('← Меню', callback_data='show_menu')
                 markup.add(btn_menu)
 
-                bot.send_message(
-                    call.message.chat.id,
+                edit_card(
+                    call.message,
                     f"Вы в клубе до {end_date_str}.\n{status_text}",
                     reply_markup=markup
                 )
@@ -1094,8 +1081,8 @@ def show_status_callback(call):
             btn_menu = types.InlineKeyboardButton('← Меню', callback_data='show_menu')
             markup.add(btn_menu)
             
-            bot.send_message(
-                call.message.chat.id,
+            edit_card(
+                call.message,
                 "Подписки пока нет. Вступить можно здесь ⬇️",
                 reply_markup=markup
             )
@@ -1104,8 +1091,8 @@ def show_status_callback(call):
         logger.error(f"Ошибка при проверке статуса подписки: {str(e)}")
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton('← Меню', callback_data='show_menu'))
-        bot.send_message(
-            call.message.chat.id,
+        edit_card(
+            call.message,
             "❌ Произошла ошибка при проверке статуса подписки. Попробуйте позже.",
             reply_markup=markup
         )
@@ -1127,11 +1114,7 @@ def process_main_menu(call):
                 return show_status_callback(call)
 
             bot.answer_callback_query(call.id)
-            # Старые кнопки возврата использовали тот же callback, что и «Вступить в клуб».
-            keyboard = getattr(getattr(call.message, "reply_markup", None), "keyboard", ())
-            returning = any(button.callback_data == "show_subscribe" and button.text.startswith("←")
-                            for row in keyboard for button in row)
-            show_subscription_menu(call.message, edit=returning)
+            show_subscription_menu(call.message, edit=True)
         elif call.data == 'show_status':
             show_status_callback(call)
         elif call.data == 'show_support':
@@ -1148,12 +1131,8 @@ def process_main_menu(call):
                     show_alert=True
                 )
         elif call.data == 'show_menu':
-            try:
-                # Удаляем сообщение с кнопкой
-                bot.delete_message(call.message.chat.id, call.message.message_id)
-            except Exception as e:
-                logger.warning(f"Не удалось удалить сообщение при возврате в меню: {e}")
-            show_main_menu(call.message)
+            bot.answer_callback_query(call.id)
+            show_main_menu(call.message, edit=True)
         
     except Exception as e:
         logger.error(f"Ошибка при обработке кнопки меню: {str(e)}")
@@ -1888,18 +1867,12 @@ FEEDBACK_REASONS = {
 }
 
 
-def ask_feedback(chat_id):
+def ask_feedback(message, confirmation):
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(*[types.InlineKeyboardButton(v, callback_data=f"fb|{k}") for k, v in FEEDBACK_REASONS.items()])
     markup.add(types.InlineKeyboardButton("✍️ Напишу сам", callback_data="fb|text"))
     markup.add(types.InlineKeyboardButton("Пропустить", callback_data="fb|skip"))
-    try:
-        bot.send_message(chat_id,
-                         "Если не трудно, подскажи: что не понравилось или чего не хватило? "
-                         "Мне это правда важно, чтобы клуб становился лучше.",
-                         reply_markup=markup)
-    except Exception as e:
-        logger.warning(f"Не удалось спросить отзыв у {chat_id}: {e}")
+    edit_card(message, confirmation + "\n\nЕсли хотите, расскажите, чего вам не хватило.", markup)
 
 
 def save_feedback(user, reason, text=None):
@@ -1932,7 +1905,7 @@ def feedback_callback(call):
         pass
     try:
         if key == "skip":
-            bot.edit_message_text("Спасибо! Буду рад видеть вас снова 🌙", call.message.chat.id, call.message.message_id)
+            edit_card(call.message, "Спасибо! Буду рад видеть вас снова 🌙")
         elif key == "text":
             bot.edit_message_text("Напишите одним сообщением, я прочитаю.", call.message.chat.id, call.message.message_id)
             bot.register_next_step_handler(call.message, _feedback_text_step)

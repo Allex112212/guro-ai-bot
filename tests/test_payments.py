@@ -95,6 +95,7 @@ def fake_ban(chat_id, user_id, **kw):
 B.bot.get_chat_member = fake_get_chat_member
 B.bot.ban_chat_member = fake_ban
 B.bot.unban_chat_member = lambda chat_id, user_id, **kw: True
+real_main_menu = B.show_main_menu
 B.show_main_menu = lambda *a, **k: None
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -347,8 +348,8 @@ with mock.patch.object(B, "create_payment_link", wraps=B.create_payment_link) as
     with mock.patch.object(B, "check_subscription_status", return_value={"status": "inactive"}):
         B.process_main_menu(call)
     text, markup = CARDS[-1]
-    check("Вход присылает одну карточку", len(CARDS) == 1 and not edited_ids)
-    call.message = SimpleNamespace(chat=msg.chat, message_id=11)
+    check("Вход редактирует главное меню", len(CARDS) == 1 and edited_ids == [1])
+    call.message = msg
     buttons = [row[0] for row in markup.keyboard]
     rub = next(b for b in buttons if b.callback_data and b.callback_data.startswith("quote|RUB"))
     check("Тариф и сумма до создания счёта", "Один месяц стоит 2 000 ₽" in text and rub.text == "💳 Карта РФ" and not create.called)
@@ -369,7 +370,7 @@ with mock.patch.object(B, "create_payment_link", wraps=B.create_payment_link) as
     check("В счёте нет оферты", all(b.text != "📋 Оферта" for row in CARDS[-1][1].keyboard for b in row))
     call.data = "checkout_back"
     B.process_pay_method_callback(call)
-    check("Возврат открывает исходную карточку с одной офертой", edited_ids[-1] == 11 and
+    check("Возврат открывает исходную карточку с одной офертой", edited_ids[-1] == 1 and
           sum(b.text == "📋 Оферта" for row in CARDS[-1][1].keyboard for b in row) == 1)
     call.data = rub.callback_data
     B.confirm_checkout(call)
@@ -408,7 +409,21 @@ check("Экраны оплаты без повторов", all(B.CANCEL_NOTE not
 
 check("Ожидание и ссылка меняют одну карточку",
       any(text.startswith("⏳") and "страницу оплаты" in following
-          for (text, _), (following, _) in zip(CARDS, CARDS[1:])) and not deleted and set(edited_ids) == {11})
+          for (text, _), (following, _) in zip(CARDS, CARDS[1:])) and not deleted and set(edited_ids) == {1})
+# Весь путь кнопок после /start работает с исходным message_id.
+with mock.patch.object(B, "show_main_menu", real_main_menu), mock.patch.object(B, "check_subscription_status", return_value={"status":"inactive"}), mock.patch.object(B.bot, "send_message", side_effect=AssertionError("Повторная отправка меню")):
+    edits_before = len(edited_ids)
+    B.show_about_callback(call)
+    B.show_status_callback(call)
+    for action in ("show_menu", "show_subscribe"):
+        call.data = action
+        B.process_main_menu(call)
+    call.data = "pay|FX"
+    B.process_pay_method_callback(call)
+    call.data = "checkout_back"
+    B.process_pay_method_callback(call)
+    check("Канал, статус, меню, тариф, валюта и возврат на одном ID",
+          edited_ids[edits_before:] == [msg.message_id]*6 and not deleted)
 B.bot.send_message = original_send
 B.bot.delete_message = original_delete
 B.bot.edit_message_text = original_edit
