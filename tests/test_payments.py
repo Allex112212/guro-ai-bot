@@ -288,7 +288,7 @@ check("пустой PAYMENT_DOMAIN → исходная ссылка", B.shorten
 SENT.clear()
 B.link_command(SimpleNamespace(from_user=SimpleNamespace(id="u1"), chat=SimpleNamespace(id="u1"), text="/link"))
 B.link_command(SimpleNamespace(from_user=SimpleNamespace(id="nobody"), chat=SimpleNamespace(id="nobody"), text="/link"))
-check("/link: подписчик получает ссылку", any(c == "u1" and "ты на ночной смене" in t for c, t in SENT))
+check("/link: подписчик получает ссылку", any(c == "u1" and "вы на ночной смене" in t for c, t in SENT))
 check("/link: без подписки — отказ", any(c == "nobody" and "Активной подписки" in t for c, t in SENT))
 
 # 20. «Залипшая» дата Lava: два разных продления с одинаковым timestamp засчитываются оба
@@ -332,7 +332,11 @@ def send_card(chat_id, text, **kw):
 B.bot.send_message = send_card
 deleted = []
 B.bot.delete_message = lambda chat_id, mid: deleted.append(mid)
-B.bot.edit_message_text = mock.Mock(side_effect=AssertionError("Исходная карточка отредактирована"))
+edited_ids = []
+def edit_card(text, chat, mid, **kw):
+    CARDS.append((text, kw.get("reply_markup")))
+    edited_ids.append(mid)
+B.bot.edit_message_text = edit_card
 B.bot.answer_callback_query = lambda *a, **kw: None
 B.PAYMENT_DOMAIN = ""
 B._SUBS_CACHE["data"] = None
@@ -343,6 +347,8 @@ with mock.patch.object(B, "create_payment_link", wraps=B.create_payment_link) as
     with mock.patch.object(B, "check_subscription_status", return_value={"status": "inactive"}):
         B.process_main_menu(call)
     text, markup = CARDS[-1]
+    check("Вход присылает одну карточку", len(CARDS) == 1 and not edited_ids)
+    call.message = SimpleNamespace(chat=msg.chat, message_id=11)
     buttons = [row[0] for row in markup.keyboard]
     rub = next(b for b in buttons if b.callback_data and b.callback_data.startswith("quote|RUB"))
     check("Тариф и сумма до создания счёта", "Один месяц стоит 2 000 ₽" in text and rub.text == "💳 Карта РФ" and not create.called)
@@ -355,10 +361,16 @@ with mock.patch.object(B, "create_payment_link", wraps=B.create_payment_link) as
     B.process_pay_method_callback(call)
     choices = [row[0] for row in CARDS[-1][1].keyboard if (row[0].callback_data or "").startswith("quote|")]
     check("До выбора валюты нет счёта", len(choices) == 2 and not create.called)
+    check("В выборе валюты нет оферты", all(b.text != "📋 Оферта" for row in CARDS[-1][1].keyboard for b in row))
     call.data = choices[0].callback_data
     B.confirm_checkout(call)
     check("Один выбранный счёт в валюте", create.call_count == 1 and create.call_args.args[-1] == "USD"
           and "18 $" in CARDS[-1][1].keyboard[0][0].text)
+    check("В счёте нет оферты", all(b.text != "📋 Оферта" for row in CARDS[-1][1].keyboard for b in row))
+    call.data = "checkout_back"
+    B.process_pay_method_callback(call)
+    check("Возврат открывает исходную карточку с одной офертой", edited_ids[-1] == 11 and
+          sum(b.text == "📋 Оферта" for row in CARDS[-1][1].keyboard for b in row) == 1)
     call.data = rub.callback_data
     B.confirm_checkout(call)
     check("Кнопка оплаты на согласованную сумму", create.call_count == 2 and
@@ -394,9 +406,9 @@ with mock.patch.object(B, "create_payment_link", wraps=B.create_payment_link) as
 check("Экраны оплаты без повторов", all(B.CANCEL_NOTE not in text and "принимаешь" not in text
       and "автоматически" not in text for text, _ in CARDS))
 
-check("Ожидание и ссылка приходят отдельными сообщениями",
+check("Ожидание и ссылка меняют одну карточку",
       any(text.startswith("⏳") and "страницу оплаты" in following
-          for (text, _), (following, _) in zip(CARDS, CARDS[1:])) and msg.message_id not in deleted and not B.bot.edit_message_text.called)
+          for (text, _), (following, _) in zip(CARDS, CARDS[1:])) and not deleted and set(edited_ids) == {11})
 B.bot.send_message = original_send
 B.bot.delete_message = original_delete
 B.bot.edit_message_text = original_edit
