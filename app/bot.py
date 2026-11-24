@@ -3,6 +3,7 @@ import logging
 import sqlite3
 import requests
 import telebot
+from studio_stats import StudioStats
 from telebot import types, apihelper
 import threading
 import time
@@ -225,16 +226,18 @@ def removals_paused():
     """Переключатель «не удалять из канала» (на время сбоев Lava с банками)."""
     return os.getenv("REMOVALS_PAUSED", "") == "1" or get_setting("removals_paused", "0") == "1"
 
-# В начале файла, где определяются другие константы
-default_message = """Привет! Это бот закрытого канала Студии Гуро.
-Нажимай кнопку ниже ⬇️"""
+CANCEL_NOTE = "Подписку можно отменить в любой момент здесь, в боте."
+MAIN_MESSAGE = os.getenv("STUDIO_INTRO_TEXT") or (
+    "Привет, я Гуро. «Ночная смена» — мой дневник о том, как я снимаю кино с ИИ. "
+    "Показываю, как собираю сцены, выбираю дубли, монтирую и работаю со звуком."
+)
+ABOUT_TEXT = os.getenv("STUDIO_CHANNEL_TEXT") or (
+    "В «Ночной смене» я показываю работу над своими фильмами. "
+    "Открываю проект, делюсь промптами и референсами, сравниваю дубли и объясняю решения по монтажу и звуку."
+)
+MAIN_MESSAGE = MAIN_MESSAGE.replace(r"\n", "\n").strip() + "\n\n" + CANCEL_NOTE
+ABOUT_TEXT = ABOUT_TEXT.replace(r"\n", "\n").strip() + "\n\n" + CANCEL_NOTE
 
-# Получаем сообщение из переменной окружения или используем значение по умолчанию
-MAIN_MESSAGE = os.getenv("MAIN_MESSAGE", default_message).replace('\\n', '\n')
-
-# Получаем текст "О канале" из переменной окружения
-DEFAULT_ABOUT_TEXT = """Закрытый канал Студии Гуро."""
-ABOUT_TEXT = os.getenv("ABOUT_TEXT", DEFAULT_ABOUT_TEXT).replace('\\n', '\n')
 
 PAYMENT_DOMAIN = os.getenv("PAYMENT_DOMAIN", "")
 OFFER_URL = os.getenv("OFFER_URL", "")  # своя ссылка на оферту, если задана
@@ -271,6 +274,8 @@ REMIND_BEFORE_DAYS = [3, 1]  # Напоминание тем, у кого авт
 
 # Инициализация бота
 bot = telebot.TeleBot(BOT_TOKEN)
+studio_stats = StudioStats(DB_PATH, ADMIN_ID)
+studio_stats.install(bot)
 
 
 # Функция для получения списка доступных подписок
@@ -286,7 +291,7 @@ def get_available_subscriptions(force=False):
     data = _fetch_available_subscriptions()
     if data:
         _SUBS_CACHE["data"], _SUBS_CACHE["at"] = data, now
-    return data or _SUBS_CACHE["data"]
+    return data if force else data or _SUBS_CACHE["data"]
 
 
 def _fetch_available_subscriptions():
@@ -745,113 +750,50 @@ def notify_admin(message):
         return False
 
 
-# Функция для показа меню выбора периода подписки
-def show_subscription_menu(message, call=None):
-    """
-    Показывает меню выбора периода подписки
-    """
-    # Получаем список доступных подписок
+def render_checkout(message, call, text, markup):
+    if call:
+        bot.edit_message_text(text, message.chat.id, message.message_id, reply_markup=markup)
+    else:
+        bot.send_message(message.chat.id, text, reply_markup=markup)
+
+
+def monthly_prices(sub):
+    return next((price["currencies"] for price in sub["prices"]
+                 if price["periodicity"] == "MONTHLY"), {})
+
+
+def currency_button(currency, amount, title):
+    quoted = _fmt_amount(amount)
+    symbol = CURRENCY_TRANSLATIONS.get(currency, currency)
+    return types.InlineKeyboardButton(f"{title}{quoted} {symbol}",
+                                      callback_data=f"quote|{currency}|{amount}")
+
+
+def show_subscription_menu(message, call=None, foreign=False):
     subscriptions = get_available_subscriptions()
-    if not subscriptions:
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        btn_menu = types.InlineKeyboardButton('← Меню', callback_data='show_menu')
-        markup.add(btn_menu)
-
-        try:
-            if call:
-                bot.edit_message_text(
-                    "Произошла ошибка при получении списка подписок. Пожалуйста, попробуйте позже.",
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    reply_markup=markup
-                )
-            else:
-                bot.send_message(
-                    message.chat.id,
-                    "Произошла ошибка при получении списка подписок. Пожалуйста, попробуйте позже.",
-                    reply_markup=markup
-                )
-        except Exception as e:
-            logger.error(f"Ошибка при отображении ошибки подписок: {e}")
-        return
-
-    # Новый путь (23.11.2026): сначала способ оплаты — «Карта РФ» / «Зарубежная карта»,
-    # потом сразу кнопка-ссылка на Lava. Старое меню периодов ниже оставлено как запасное.
-    sub = subscriptions[0]
-    currencies = set()
-    for price in sub["prices"]:
-        currencies.update(price["currencies"].keys())
+    prices = monthly_prices(subscriptions[0]) if subscriptions else {}
     markup = types.InlineKeyboardMarkup(row_width=1)
-    if "RUB" in currencies:
-        markup.add(types.InlineKeyboardButton("💳 Карта РФ", callback_data="pay|RUB"))
-    if currencies & {"USD", "EUR"}:
-        markup.add(types.InlineKeyboardButton("🌍 Зарубежная карта", callback_data="pay|FX"))
-    if OFFER_URL:
-        markup.add(types.InlineKeyboardButton('📋 Оферта', url=OFFER_URL))
-    markup.add(types.InlineKeyboardButton('← Меню', callback_data='show_menu'))
-    message_text = f"<b>{sub['name']}</b>\n\n{sub['description']}\n\nВыберите, пожалуйста, карту:{_offer_note()}"
-    try:
-        if call:
-            bot.edit_message_text(message_text, chat_id=call.message.chat.id,
-                                  message_id=call.message.message_id,
-                                  reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
-        else:
-            bot.send_message(message.chat.id, message_text, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
-    except Exception as e:
-        logger.warning(f"Не удалось отредактировать сообщение, отправляем новое: {e}")
-        bot.send_message(message.chat.id, message_text, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
-    return
+    if foreign:
+        for currency in ("USD", "EUR"):
+            if currency in prices:
+                markup.add(currency_button(currency, prices[currency], "1 месяц · "))
+    else:
+        if "RUB" in prices:
+            markup.add(currency_button("RUB", prices["RUB"], "Карта РФ · "))
+        if any(currency in prices for currency in ("USD", "EUR")):
+            markup.add(types.InlineKeyboardButton("Зарубежная карта", callback_data="pay|FX"))
+    if markup.keyboard:
+        text = "Ночная смена · 1 месяц. Подписка продлевается автоматически."
+        text += "\nВыбери валюту оплаты." if foreign else "\nВыбери способ оплаты."
+        if OFFER_URL:
+            markup.add(types.InlineKeyboardButton("Условия подписки", url=OFFER_URL))
+            text += "\nОплачивая подписку, ты принимаешь условия оферты."
+    else:
+        text = "Не удалось получить месячный тариф. Попробуй позже."
+    markup.add(types.InlineKeyboardButton("← Назад", callback_data="show_subscribe" if foreign else "show_menu"))
+    render_checkout(message, call, text + "\n\n" + CANCEL_NOTE, markup)
 
-    # Для каждой подписки создаем отдельное сообщение с кнопками периодов (старый путь)
-    for sub in subscriptions:
-        markup = types.InlineKeyboardMarkup(row_width=1)
 
-        # Создаем кнопки для каждого периода
-        for price in sub["prices"]:
-            period_text = PERIOD_TRANSLATIONS.get(price["periodicity"], price["periodicity"])
-            rub_amount = price["currencies"].get("RUB", 0)
-            button_text = f"{period_text} - {rub_amount} ₽"
-
-            # Сокращаем periodicity для callback_data
-            short_period = {
-                "MONTHLY": "1m",
-                "PERIOD_90_DAYS": "3m",
-                "PERIOD_180_DAYS": "6m",
-                "PERIOD_YEAR": "1y"
-            }.get(price["periodicity"], price["periodicity"])
-
-            callback_data = f"p|{sub['offer_id']}|{short_period}"
-            markup.add(types.InlineKeyboardButton(text=button_text, callback_data=callback_data))
-
-        # Добавляем кнопку возврата в меню
-        markup.add(types.InlineKeyboardButton('← Меню', callback_data='show_menu'))
-
-        message_text = f"<b>{sub['name']}</b>\n\n{sub['description']}\n\nВыберите период подписки:"
-
-        try:
-            if call:
-                bot.edit_message_text(
-                    message_text,
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    reply_markup=markup,
-                    parse_mode="HTML"
-                )
-            else:
-                bot.send_message(
-                    message.chat.id,
-                    message_text,
-                    reply_markup=markup,
-                    parse_mode="HTML"
-                )
-        except Exception as e:
-            logger.warning(f"Не удалось отредактировать сообщение, отправляем новое: {e}")
-            bot.send_message(
-                message.chat.id,
-                message_text,
-                reply_markup=markup,
-                parse_mode="HTML"
-            )
 # Функция для показа главного меню
 def show_main_menu(message):
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -860,7 +802,7 @@ def show_main_menu(message):
     subscription = check_subscription_status(message.chat.id)
     
     # Общие кнопки
-    btn_about = types.InlineKeyboardButton('👋 Обо мне', callback_data='show_about')
+    btn_about = types.InlineKeyboardButton('🎬 Что в канале', callback_data='show_about')
     
     # Создаем кнопку поддержки только если SUPPORT_USERNAME задан
     btn_support = None
@@ -1162,7 +1104,7 @@ def show_status_callback(call):
             # Показываем кнопки для тех, у кого нет подписки
             markup = types.InlineKeyboardMarkup(row_width=1)
             btn_subscribe = types.InlineKeyboardButton('🌙 Вступить в клуб', callback_data='show_subscribe')
-            btn_about = types.InlineKeyboardButton('👋 Обо мне', callback_data='show_about')
+            btn_about = types.InlineKeyboardButton('🎬 Что в канале', callback_data='show_about')
             
             # Создаем кнопку поддержки только если SUPPORT_USERNAME задан
             if SUPPORT_USERNAME:
@@ -1245,132 +1187,79 @@ def _fmt_amount(amount):
     return f"{a:.2f}".rstrip("0").rstrip(".")
 
 
-# Способ оплаты → сразу кнопки-ссылки на Lava (23.11.2026)
-@bot.callback_query_handler(func=lambda call: call.data.startswith('pay|'))
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("pay|", "p|", "c|")))
 def process_pay_method_callback(call):
-    user_id = call.from_user.id
-    method = call.data.split('|', 1)[1]
-    wanted = ["RUB"] if method == "RUB" else ["USD", "EUR"]
+    bot.answer_callback_query(call.id)
+    show_subscription_menu(call.message, call, foreign=call.data == "pay|FX")
+
+
+# Telegram может прислать два нажатия одной экранной кнопки подряд.
+_checkout_lock = threading.Lock()
+_checkout_inflight = set()
+_checkout_urls = {}
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("quote|"))
+def confirm_checkout(call):
+    bot.answer_callback_query(call.id)
+    if call.message.chat.type != "private" or call.message.chat.id != call.from_user.id:
+        return
+    key = (call.from_user.id, call.message.message_id, call.data)
+    with _checkout_lock:
+        if key in _checkout_inflight:
+            return
+        _checkout_inflight.add(key)
     try:
-        bot.answer_callback_query(call.id)
-    except Exception:
-        pass
+        return prepare_checkout(call, key)
+    finally:
+        with _checkout_lock:
+            _checkout_inflight.discard(key)
+
+
+def prepare_checkout(call, key):
     try:
-        bot.edit_message_text("⏳ Секунду, готовлю оплату…", call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
-    try:
-        subscriptions = get_available_subscriptions()
+        _, currency, quoted = call.data.split("|")
+        if currency not in ("RUB", "USD", "EUR"):
+            return
+        bot.edit_message_text("Секунду, готовлю ссылку на оплату…", call.message.chat.id,
+                              call.message.message_id)
+        subscriptions = get_available_subscriptions(force=True)
         if not subscriptions:
-            raise ValueError("Нет подписок")
+            raise ValueError("Тариф недоступен")
         sub = subscriptions[0]
+        amount = monthly_prices(sub).get(currency)
+        if amount is None or str(amount) != quoted:
+            return show_subscription_menu(call.message, call, foreign=currency != "RUB")
+        studio_stats.record(call.from_user.id, checkout=True)
+        now = time.monotonic()
+        with _checkout_lock:
+            for old_key, (expiry, _) in list(_checkout_urls.items()):
+                if expiry <= now:
+                    del _checkout_urls[old_key]
+            cached = _checkout_urls.get(key)
+        if cached:
+            url = cached[1]
+        else:
+            data = create_payment_link(call.from_user.id, sub["offer_id"], "MONTHLY", currency)
+            if not data or not data.get("paymentUrl"):
+                raise ValueError("Ссылка недоступна")
+            remember_pending_periodicity(call.from_user.id, "MONTHLY", data.get("contractId") or data.get("id"))
+            url = shorten_payment_url(data["paymentUrl"])
+            with _checkout_lock:
+                _checkout_urls[key] = (now + 60, url)
         markup = types.InlineKeyboardMarkup(row_width=1)
-        made = 0
-        for price in sub["prices"]:
-            periodicity = price["periodicity"]
-            period_text = PERIOD_TRANSLATIONS.get(periodicity, periodicity)
-            for cur in wanted:
-                amount = price["currencies"].get(cur)
-                if amount is None:
-                    continue
-                data = create_payment_link(user_id, sub["offer_id"], periodicity, cur)
-                url = (data or {}).get("paymentUrl")
-                if not url:
-                    continue
-                try:
-                    remember_pending_periodicity(user_id, periodicity,
-                                                 data.get("contractId") or data.get("id"))
-                except Exception as e:
-                    logger.error(f"Не удалось сохранить выбранный период для {user_id}: {e}")
-                symbol = CURRENCY_TRANSLATIONS.get(cur, cur)
-                label = f"{period_text} — {_fmt_amount(amount)} {symbol}"
-                markup.add(types.InlineKeyboardButton(label, url=shorten_payment_url(url)))
-                made += 1
-        if not made:
-            raise ValueError("Не удалось создать ни одной ссылки")
-        markup.add(types.InlineKeyboardButton('← Назад', callback_data='show_subscribe'))
-        bot.edit_message_text("Нажми, откроется страница оплаты:" + _offer_note(), call.message.chat.id,
-                              call.message.message_id, reply_markup=markup,
-                              parse_mode="HTML", disable_web_page_preview=True)
-    except Exception as e:
-        logger.error(f"Ошибка при создании ссылки на оплату ({method}) для {user_id}: {e}", exc_info=True)
+        label = f"Оплатить {_fmt_amount(amount)} {CURRENCY_TRANSLATIONS.get(currency, currency)}"
+        markup.add(types.InlineKeyboardButton(label, url=url))
+        if OFFER_URL:
+            markup.add(types.InlineKeyboardButton("Условия подписки", url=OFFER_URL))
+        text = "Ночная смена · 1 месяц. Подписка продлевается автоматически."
+    except Exception:
+        logger.exception("Не удалось подготовить ссылку для подтверждённого тарифа")
         markup = types.InlineKeyboardMarkup(row_width=1)
-        markup.add(types.InlineKeyboardButton('← Назад', callback_data='show_subscribe'))
-        try:
-            bot.edit_message_text(f"Lava сейчас не отвечает. Попробуй через минуту. "
-                                  f"Если не выйдет, напиши мне: @{SUPPORT_USERNAME}", call.message.chat.id,
-                                  call.message.message_id, reply_markup=markup)
-        except Exception:
-            pass
+        text = "Не удалось подготовить ссылку. Вернись к тарифу и попробуй ещё раз."
+    markup.add(types.InlineKeyboardButton("← К тарифу", callback_data="show_subscribe"))
+    render_checkout(call.message, call, text + "\n\n" + CANCEL_NOTE, markup)
 
-
-# Обработчик для выбора периода оплаты (старый путь, оставлен для старых сообщений)
-@bot.callback_query_handler(func=lambda call: call.data.startswith('p|'))
-def process_payment_callback(call):
-    try:
-        # Получаем ID пользователя из callback
-        user_id = call.from_user.id
-        
-        # Разбираем данные из callback
-        parts = call.data.split('|')
-        if len(parts) != 3:
-            raise ValueError("Неверный формат данных callback")
-        
-        _, offer_id, short_period = parts
-        
-        # Преобразуем короткий период обратно в полный
-        period_map = {
-            "1m": "MONTHLY",
-            "3m": "PERIOD_90_DAYS",
-            "6m": "PERIOD_180_DAYS",
-            "1y": "PERIOD_YEAR"
-        }
-        periodicity = period_map.get(short_period, short_period)
-        
-        # Получаем информацию о подписке для отображения цен
-        subscriptions = get_available_subscriptions()
-        if not subscriptions:
-            raise ValueError("Не удалось получить информацию о подписке")
-        
-        # Ищем нужную подписку и период
-        subscription = next((sub for sub in subscriptions if sub["offer_id"] == offer_id), None)
-        if not subscription:
-            raise ValueError("Подписка не найдена")
-        
-        price_info = next((p for p in subscription["prices"] if p["periodicity"] == periodicity), None)
-        if not price_info:
-            raise ValueError("Информация о ценах не найдена")
-        
-        # Создаем кнопки выбора валюты
-        markup = types.InlineKeyboardMarkup(row_width=1)
-    
-        # Добавляем кнопки для каждой доступной валюты
-        for currency, amount in price_info["currencies"].items():
-            currency_symbol = CURRENCY_TRANSLATIONS.get(currency, currency)
-            button_text = f"Оплатить {amount} {currency_symbol}"
-            # Сокращаем offer_id до первых 20 символов, этого должно быть достаточно для уникальности
-            short_offer_id = offer_id[:20]
-            callback_data = f"c|{short_offer_id}|{short_period}|{currency}"
-            markup.add(types.InlineKeyboardButton(text=button_text, callback_data=callback_data))
-        
-        # Добавляем кнопку "Назад"
-        markup.add(types.InlineKeyboardButton('← Назад к выбору периода', callback_data='show_subscribe'))
-        
-        period_text = PERIOD_TRANSLATIONS.get(periodicity, periodicity)
-        bot.edit_message_text(
-            f"Выберите способ оплаты подписки на {period_text}:",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup
-        )
-        
-    except Exception as e:
-
-        logger.error(f"Ошибка при обработке callback выбора периода: {str(e)}")
-        bot.answer_callback_query(
-            call.id,
-            "Произошла ошибка. Пожалуйста, попробуйте позже."
-        )
 
 # Добавляем новую функцию для сокращения ссылки
 def shorten_payment_url(payment_url: str) -> str:
@@ -1402,90 +1291,8 @@ def shorten_payment_url(payment_url: str) -> str:
         logger.error(f"Ошибка при сокращении ссылки: {str(e)}")
         return payment_url
 
-# Модифицируем функцию process_currency_callback
-@bot.callback_query_handler(func=lambda call: call.data.startswith('c|'))
-def process_currency_callback(call):
-    try:
-        # Получаем ID пользователя из callback
-        user_id = call.from_user.id
-        logger.info(f"Обработка выбора валюты для пользователя {user_id}")
-        
-        # Разбираем данные из callback
-        parts = call.data.split('|')
-        if len(parts) != 4:
-            raise ValueError("Неверный формат данных callback")
-        
-        _, short_offer_id, short_period, currency = parts
-        
-        # Получаем полный offer_id
-        subscriptions = get_available_subscriptions()
-        full_offer_id = next((sub["offer_id"] for sub in subscriptions 
-                        if sub["offer_id"].startswith(short_offer_id)), None)
-        
-        if not full_offer_id:
-            raise ValueError("Подписка не найдена")
-            
-        # Преобразуем короткий период обратно в полный
-        period_map = {
-            "1m": "MONTHLY",
-            "3m": "PERIOD_90_DAYS",
-            "6m": "PERIOD_180_DAYS",
-            "1y": "PERIOD_YEAR"
-        }
-        periodicity = period_map.get(short_period)
-        
-        # Создаем ссылку на оплату с полным offer_id
-        payment_data = create_payment_link(user_id, full_offer_id, periodicity, currency)
-        logger.info(f"Получены данные для оплаты: {payment_data}")
-        
-        if not payment_data:
-            raise ValueError("Не удалось создать ссылку на оплату")
-        
-        # Получаем ссылку из ответа
-        payment_url = payment_data.get('paymentUrl')
-        if not payment_url:
-            raise ValueError("В ответе отсутствует ссылка на оплату")
 
-        try:
-            remember_pending_periodicity(
-                user_id, periodicity,
-                payment_data.get('contractId') or payment_data.get('id'))
-        except Exception as e:
-            logger.error(f"Не удалось сохранить выбранный период для {user_id}: {e}")
-        
-        # Сокращаем ссылку
-        short_payment_url = shorten_payment_url(payment_url)
-        logger.info(f"Создана короткая ссылка на оплату: {short_payment_url}")
-        
-        # Создаем клавиатуру с кнопками
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        pay_button = types.InlineKeyboardButton('💳 Перейти к оплате', url=short_payment_url)
-        back_button = types.InlineKeyboardButton('← Назад к выбору периода', callback_data='show_subscribe')
-        markup.add(pay_button)
-        markup.add(back_button)
-        
-        # Отправляем сообщение с кнопкой оплаты
-        bot.edit_message_text(
-            "Для оплаты подписки нажмите на кнопку ниже:",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup
-        )
-        
-        # Отмечаем callback как обработанный
-        bot.answer_callback_query(call.id)
-        
-        # Логируем успешное создание ссылки
-        logger.info(f"Успешно создана ссылка на оплату для пользователя {user_id}")
-        
-    except Exception as e:
-        logger.error(f"Ошибка при создании ссылки на оплату: {str(e)}", exc_info=True)
-        bot.answer_callback_query(
-            call.id,
-            "Произошла ошибка при создании ссылки на оплату. Попробуйте позже."
-        )
 
-# Добавляем функцию для расчета оставшихся дней подписки
 def calculate_days_left(timestamp, periodicity):
     # Преобразуем строку в datetime
     start_date = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
@@ -1861,7 +1668,7 @@ def status_command(message):
             # Показываем кнопки для тех, у кого нет подписки
             markup = types.InlineKeyboardMarkup(row_width=1)
             btn_subscribe = types.InlineKeyboardButton('🌙 Вступить в клуб', callback_data='show_subscribe')
-            btn_about = types.InlineKeyboardButton('👋 Обо мне', callback_data='show_about')
+            btn_about = types.InlineKeyboardButton('🎬 Что в канале', callback_data='show_about')
             
             if SUPPORT_USERNAME:
                 btn_support = types.InlineKeyboardButton('💬 Написать мне', url=f"https://t.me/{SUPPORT_USERNAME}")
@@ -2286,6 +2093,7 @@ def admin_help_command(message):
         "/removals_off — поставить удаление из канала на паузу (если у Lava сбой)\n"
         "/removals_on — снова включить удаление\n"
         "/backup — прислать копию базы\n"
+        "/stats — посещения, переходы к оплате и источники\n"
         "/export — список участников в CSV (запасной план)\n"
         "/refresh_prices — сразу подтянуть новую цену после смены в Lava\n"
         "/remove ID — удалить человека из канала вручную\n"
