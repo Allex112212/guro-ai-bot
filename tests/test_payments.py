@@ -95,7 +95,6 @@ def fake_ban(chat_id, user_id, **kw):
 B.bot.get_chat_member = fake_get_chat_member
 B.bot.ban_chat_member = fake_ban
 B.bot.unban_chat_member = lambda chat_id, user_id, **kw: True
-real_main_menu = B.show_main_menu
 B.show_main_menu = lambda *a, **k: None
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -289,7 +288,7 @@ check("пустой PAYMENT_DOMAIN → исходная ссылка", B.shorten
 SENT.clear()
 B.link_command(SimpleNamespace(from_user=SimpleNamespace(id="u1"), chat=SimpleNamespace(id="u1"), text="/link"))
 B.link_command(SimpleNamespace(from_user=SimpleNamespace(id="nobody"), chat=SimpleNamespace(id="nobody"), text="/link"))
-check("/link: подписчик получает ссылку", any(c == "u1" and "вы на ночной смене" in t for c, t in SENT))
+check("/link: подписчик получает ссылку", any(c == "u1" and "ты на ночной смене" in t for c, t in SENT))
 check("/link: без подписки — отказ", any(c == "nobody" and "Активной подписки" in t for c, t in SENT))
 
 # 20. «Залипшая» дата Lava: два разных продления с одинаковым timestamp засчитываются оба
@@ -322,129 +321,37 @@ check("active без продления: админу одно сообщени�
 B.remove_command(SimpleNamespace(from_user=SimpleNamespace(id=111), chat=SimpleNamespace(id=111), text="/remove u9"))
 check("/remove удаляет", MEMBERS["u9"] == "kicked" and member("u9")[0] == "removed")
 
-# Цена и срок видны до создания платёжной ссылки.
-CARDS = []
-original_send = B.bot.send_message
-original_delete = B.bot.delete_message
-original_edit = B.bot.edit_message_text
-def send_card(chat_id, text, **kw):
-    CARDS.append((text, kw.get("reply_markup")))
-    return SimpleNamespace(message_id=len(CARDS) + 10)
-B.bot.send_message = send_card
-deleted = []
-B.bot.delete_message = lambda chat_id, mid: deleted.append(mid)
-edited_ids = []
-def edit_card(text, chat, mid, **kw):
-    CARDS.append((text, kw.get("reply_markup")))
-    edited_ids.append(mid)
-B.bot.edit_message_text = edit_card
+# 24. Меню оплаты: «Карта РФ» / «Зарубежная карта», без цен на первом шаге
+EDITS = []
+B.bot.edit_message_text = lambda text, *a, **kw: EDITS.append((text, kw.get("reply_markup")))
 B.bot.answer_callback_query = lambda *a, **kw: None
 B.PAYMENT_DOMAIN = ""
 B._SUBS_CACHE["data"] = None
-msg = SimpleNamespace(chat=SimpleNamespace(id=1010, type="private"), message_id=1)
-call = SimpleNamespace(id="c", from_user=SimpleNamespace(id=1010), message=msg, data="show_subscribe")
-with mock.patch.object(B, "create_payment_link", wraps=B.create_payment_link) as create:
-    call.from_user.username = "test"
-    with mock.patch.object(B, "check_subscription_status", return_value={"status": "inactive"}):
-        B.process_main_menu(call)
-    text, markup = CARDS[-1]
-    check("Вход редактирует главное меню", len(CARDS) == 1 and edited_ids == [1])
-    call.message = msg
-    buttons = [row[0] for row in markup.keyboard]
-    rub = next(b for b in buttons if b.callback_data and b.callback_data.startswith("quote|RUB"))
-    check("Тариф и сумма до создания счёта", "Один месяц стоит 2 000 ₽" in text and rub.text == "💳 Карта РФ" and not create.called)
+msg = SimpleNamespace(chat=SimpleNamespace(id="u10"), message_id=1)
+call = SimpleNamespace(id="c", from_user=SimpleNamespace(id="u10"), message=msg, data="show_subscribe")
+EDITS.clear()
+B.show_subscription_menu(msg, call=call)
+kb = EDITS[-1][1].keyboard
+labels = [b.text for row in kb for b in row]
+check("меню: «Карта РФ» и «Зарубежная карта» без цен",
+      "💳 Карта РФ" in labels and "🌍 Зарубежная карта" in labels and not any("₽" in l for l in labels), labels)
 
-    labels = [b.text for b in buttons]
-    check("Исходные значки и оферта", rub.text.startswith("💳 Карта РФ") and "🌍 Зарубежная карта" in labels
-          and "📋 Оферта" in labels)
-    check("Отмена только в приветствии", B.MAIN_MESSAGE.count(B.CANCEL_NOTE) == 1 and B.CANCEL_NOTE not in B.ABOUT_TEXT)
-    call.data = "pay|FX"
-    B.process_pay_method_callback(call)
-    choices = [row[0] for row in CARDS[-1][1].keyboard if (row[0].callback_data or "").startswith("quote|")]
-    check("До выбора валюты нет счёта", len(choices) == 2 and not create.called)
-    check("В выборе валюты нет оферты", all(b.text != "📋 Оферта" for row in CARDS[-1][1].keyboard for b in row))
-    call.data = choices[0].callback_data
-    B.confirm_checkout(call)
-    check("Один выбранный счёт в валюте", create.call_count == 1 and create.call_args.args[-1] == "USD"
-          and "18 $" in CARDS[-1][1].keyboard[0][0].text)
-    check("В счёте нет оферты", all(b.text != "📋 Оферта" for row in CARDS[-1][1].keyboard for b in row))
-    call.data = "checkout_back"
-    B.process_pay_method_callback(call)
-    check("Возврат открывает исходную карточку с одной офертой", edited_ids[-1] == 1 and
-          sum(b.text == "📋 Оферта" for row in CARDS[-1][1].keyboard for b in row) == 1)
-    call.data = rub.callback_data
-    B.confirm_checkout(call)
-    check("Кнопка оплаты на согласованную сумму", create.call_count == 2 and
-          CARDS[-1][1].keyboard[0][0].text == "Оплатить 2 000 ₽ за 1 месяц")
-    B.confirm_checkout(call)
-    check("Повторное нажатие использует ту же ссылку", create.call_count == 2)
-    call.data = "quote|RUB|1500.0"
-    B.confirm_checkout(call)
-    check("Изменение цены требует нового выбора", create.call_count == 2 and
-          "2 000 ₽" in CARDS[-1][0])
-    call.data = "pay|RUB"
-    B.process_pay_method_callback(call)
-    check("Старая кнопка возвращает к тарифу", create.call_count == 2)
-    LAVA_DOWN["value"] = True
-    call.data = rub.callback_data
-    B.confirm_checkout(call)
-    check("Нет свежей цены — нет ссылки", create.call_count == 2 and "Не удалось" in CARDS[-1][0])
-    LAVA_DOWN["value"] = False
-    LAVA_PRICES["MONTHLY"] = 2500
-    try:
-        B.get_available_subscriptions(force=True)
-        B.show_subscription_menu(msg)
-        menu_text, menu_keyboard = CARDS[-1]
-        button = menu_keyboard.keyboard[0][0]
-        call.data = button.callback_data
-        B.confirm_checkout(call)
-        check("Цена Lava 2 500 совпадает в меню и в оплате",
-              "2 500 ₽" in menu_text and CARDS[-1][1].keyboard[0][0].text == "Оплатить 2 500 ₽ за 1 месяц")
-    finally:
-        LAVA_PRICES["MONTHLY"] = 2000
-        B.get_available_subscriptions(force=True)
+# 25. Карта РФ → сразу кнопки-ссылки на Lava в рублях
+EDITS.clear()
+B.process_pay_method_callback(SimpleNamespace(id="c", from_user=SimpleNamespace(id="u10"), message=msg, data="pay|RUB"))
+kb = EDITS[-1][1].keyboard
+rub = [(b.text, b.url) for row in kb for b in row if b.url]
+check("Карта РФ → «1 месяц — 2 000 ₽» ведёт прямо на Lava",
+      any(t == "1 месяц — 2 000 ₽" and u.startswith("https://app.lava.top") for t, u in rub)
+      and not any("$" in t or "€" in t for t, _ in rub), rub)
 
-check("Экраны оплаты без повторов", all(B.CANCEL_NOTE not in text and "принимаешь" not in text
-      and "автоматически" not in text for text, _ in CARDS))
-
-check("Ожидание и ссылка меняют одну карточку",
-      any(text.startswith("⏳") and "страницу оплаты" in following
-          for (text, _), (following, _) in zip(CARDS, CARDS[1:])) and not deleted and set(edited_ids) == {1})
-# Весь путь кнопок после /start работает с исходным message_id.
-with mock.patch.object(B, "show_main_menu", real_main_menu), mock.patch.object(B, "check_subscription_status", return_value={"status":"inactive"}), mock.patch.object(B.bot, "send_message", side_effect=AssertionError("Повторная отправка меню")):
-    edits_before = len(edited_ids)
-    B.show_about_callback(call)
-    B.show_status_callback(call)
-    for action in ("show_menu", "show_subscribe"):
-        call.data = action
-        B.process_main_menu(call)
-    call.data = "pay|FX"
-    B.process_pay_method_callback(call)
-    call.data = "checkout_back"
-    B.process_pay_method_callback(call)
-    check("Канал, статус, меню, тариф, валюта и возврат на одном ID",
-          edited_ids[edits_before:] == [msg.message_id]*6 and not deleted)
-B.bot.send_message = original_send
-B.bot.delete_message = original_delete
-B.bot.edit_message_text = original_edit
-
-# Статистика использует реальные обработчики, Telegram и Lava остаются заглушками.
-observe = next(h["function"] for h in B.bot.message_handlers if h["function"].__name__ == "observe_message")
-report = next(h["function"] for h in B.bot.message_handlers if h["function"].__name__ == "stats")
-with mock.patch.object(B.bot, "send_message") as send:
-    def visit(uid, text, kind="private"):
-        return SimpleNamespace(chat=SimpleNamespace(id=uid, type=kind), from_user=SimpleNamespace(id=uid), text=text)
-    for text in ("/start mama_hook1", "/start another_hook"):
-        observe(visit(4242, text))
-    observe(visit(4243, "/start"))
-    B.studio_stats.record(4242, checkout=True)
-    report(visit(4242, "/stats"))
-    report(visit(111, "/stats", "group"))
-    check("Статистика скрыта от зрителя и группы", not send.called)
-    report(visit(111, "/stats"))
-    result = send.call_args.args[1]
-    check("Первый источник и прямые входы", "mama_hook1: 1 /" in result and "another_hook" not in result
-          and "Без метки:" in result and "За 7 дней" in result and "За 30 дней" in result)
+# 26. Зарубежная карта → доллары и евро, без рублей
+EDITS.clear()
+B.process_pay_method_callback(SimpleNamespace(id="c", from_user=SimpleNamespace(id="u10"), message=msg, data="pay|FX"))
+kb = EDITS[-1][1].keyboard
+fx = [b.text for row in kb for b in row if b.url]
+check("Зарубежная карта → $ и €, без ₽", any("$" in t for t in fx) and any("€" in t for t in fx)
+      and not any("₽" in t for t in fx), fx)
 
 # 27. Цены запоминаются: второе открытие меню не ходит в Lava
 calls = {"n": 0}
