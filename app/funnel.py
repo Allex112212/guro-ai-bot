@@ -2,7 +2,7 @@
 
 Шаги: start (нажал «Старт») → join (открыл «Вступить») → method (выбрал карту)
 → link (увидел кнопку оплаты). Оплату и доступ берём из channel_members.
-Источник — метка из ссылки t.me/<бот>?start=instagram | telegram | youtube.
+Источник — метка из ссылки t.me/<бот>?start=instagram | telegram | youtube | tiktok | max | vk.
 Запоминается только при первом появлении человека и потом не меняется.
 Кто уже был участником до первого появления в статистике — в воронку не входит.
 Храним только Telegram ID, метку и время шагов. Админ в статистику не попадает.
@@ -145,5 +145,8 @@ class Funnel:
                      "\nСсылки с меткой источника:"
                      f"\nInstagram (шапка профиля, директ): {base}instagram"
                      f"\nTelegram-канал: {base}telegram"
-                     f"\nYouTube: {base}youtube")
+                     f"\nYouTube: {base}youtube"
+                     f"\nTikTok: {base}tiktok"
+                     f"\nMax: {base}max"
+                     f"\nВКонтакте: {base}vk")
         return "\n".join(lines)

@@ -85,7 +85,8 @@ check("ушли", "Ушли или не продлили: 1" in r)
 check("источник instagram", "instagram: 2 · 1 · 1 · 1" in r)
 check("без метки подписан", "без метки (поиск, пересылка, прямой вход): 1 · 0 · 0 · 0" in r)
 check("без «Старт» — отдельной строкой", "Ещё 1 за 30 дней зашли через меню" in r)
-check("ссылки трёх площадок", "start=instagram" in r and "start=telegram" in r and "start=youtube" in r)
+check("ссылки трёх площадок", "start=instagram" in r and "start=telegram" in r and "start=youtube" in r
+      and "start=tiktok" in r and "start=max" in r and "start=vk" in r)
 
 # Граница полуночи МСК: 23:59 МСК вчера — не «Сегодня»
 db2 = Path(tempfile.mkdtemp(prefix="funnel_")) / "t.db"
