@@ -1260,11 +1260,11 @@ def process_pay_method_callback(call):
     user_id = call.from_user.id
     method = call.data.split('|', 1)[1]
     wanted = ["RUB"] if method == "RUB" else ["USD", "EUR"]
-    funnel.record(call.from_user, "method")
     try:
         bot.answer_callback_query(call.id)
     except Exception:
         pass
+    funnel.record(call.from_user, "method")
     try:
         bot.edit_message_text("⏳ Секунду, готовлю оплату…", call.message.chat.id, call.message.message_id)
     except Exception:
@@ -1298,11 +1298,11 @@ def process_pay_method_callback(call):
                 made += 1
         if not made:
             raise ValueError("Не удалось создать ни одной ссылки")
-        funnel.record(call.from_user, "link")
         markup.add(types.InlineKeyboardButton('← Назад', callback_data='show_subscribe'))
         bot.edit_message_text("Нажми, откроется страница оплаты:" + _offer_note(), call.message.chat.id,
                               call.message.message_id, reply_markup=markup,
                               parse_mode="HTML", disable_web_page_preview=True)
+        funnel.record(call.from_user, "link")
     except Exception as e:
         logger.error(f"Ошибка при создании ссылки на оплату ({method}) для {user_id}: {e}", exc_info=True)
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -1471,7 +1471,6 @@ def process_currency_callback(call):
         # Создаем клавиатуру с кнопками
         markup = types.InlineKeyboardMarkup(row_width=1)
         pay_button = types.InlineKeyboardButton('💳 Перейти к оплате', url=short_payment_url)
-        funnel.record(call.from_user, "link")
         back_button = types.InlineKeyboardButton('← Назад к выбору периода', callback_data='show_subscribe')
         markup.add(pay_button)
         markup.add(back_button)
@@ -1486,6 +1485,7 @@ def process_currency_callback(call):
         
         # Отмечаем callback как обработанный
         bot.answer_callback_query(call.id)
+        funnel.record(call.from_user, "link")
         
         # Логируем успешное создание ссылки
         logger.info(f"Успешно создана ссылка на оплату для пользователя {user_id}")
