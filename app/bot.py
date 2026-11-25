@@ -277,6 +277,9 @@ REMIND_BEFORE_DAYS = [3, 1]  # Напоминание тем, у кого авт
 # Инициализация бота
 bot = telebot.TeleBot(BOT_TOKEN)
 
+from funnel import Funnel, source_from_start  # noqa: E402
+funnel = Funnel(DB_PATH, ADMIN_ID, os.getenv("BOT_USERNAME", "GuroStudioBot"))
+
 
 # Функция для получения списка доступных подписок
 _SUBS_CACHE = {"at": 0.0, "data": None}
@@ -1205,6 +1208,7 @@ def process_main_menu(call):
             username = call.from_user.username or f"user_{user_id}"
 
             logger.info(f"Пользователь {username} (ID: {user_id}) запросил оформление подписки через кнопку")
+            funnel.record(call.from_user, "join")
 
             # Проверяем, есть ли уже активная подписка
             subscription = check_subscription_status(user_id)
@@ -1256,6 +1260,7 @@ def process_pay_method_callback(call):
     user_id = call.from_user.id
     method = call.data.split('|', 1)[1]
     wanted = ["RUB"] if method == "RUB" else ["USD", "EUR"]
+    funnel.record(call.from_user, "method")
     try:
         bot.answer_callback_query(call.id)
     except Exception:
@@ -1293,6 +1298,7 @@ def process_pay_method_callback(call):
                 made += 1
         if not made:
             raise ValueError("Не удалось создать ни одной ссылки")
+        funnel.record(call.from_user, "link")
         markup.add(types.InlineKeyboardButton('← Назад', callback_data='show_subscribe'))
         bot.edit_message_text("Нажми, откроется страница оплаты:" + _offer_note(), call.message.chat.id,
                               call.message.message_id, reply_markup=markup,
@@ -1465,6 +1471,7 @@ def process_currency_callback(call):
         # Создаем клавиатуру с кнопками
         markup = types.InlineKeyboardMarkup(row_width=1)
         pay_button = types.InlineKeyboardButton('💳 Перейти к оплате', url=short_payment_url)
+        funnel.record(call.from_user, "link")
         back_button = types.InlineKeyboardButton('← Назад к выбору периода', callback_data='show_subscribe')
         markup.add(pay_button)
         markup.add(back_button)
@@ -2294,9 +2301,23 @@ def admin_help_command(message):
         "/export — список участников в CSV (запасной план)\n"
         "/refresh_prices — сразу подтянуть новую цену после смены в Lava\n"
         "/remove ID — удалить человека из канала вручную\n"
-        "/broadcast текст — рассылка\n\n"
+        "/broadcast текст — рассылка\n"
+        "/stats — воронка: сколько пришло, откуда, сколько оплатило\n\n"
         f"Удаление из канала сейчас: {state}"
     )
+
+
+@bot.message_handler(commands=['stats'])
+def stats_command(message):
+    """Воронка бота — только для Гуро, только в личке."""
+    if not _is_admin(message) or message.chat.type != 'private':
+        return
+    try:
+        text = funnel.report()
+    except Exception as e:
+        logger.error(f"Статистика недоступна: {e}", exc_info=True)
+        text = "Статистика сейчас недоступна, ошибка записана в лог."
+    bot.send_message(message.chat.id, text, disable_web_page_preview=True)
 
 
 def daily_backup_loop():
@@ -2322,7 +2343,8 @@ def subscribe_command(message):
     username = message.from_user.username or f"user_{user_id}"
     
     logger.info(f"Пользователь {username} (ID: {user_id}) запросил оформление подписки")
-   
+    funnel.record(message.from_user, "join")
+
     # Проверяем, есть ли уже активная подписка
     subscription = check_subscription_status(user_id)
     if subscription["status"] == "active":
@@ -2337,6 +2359,7 @@ def start_command(message):
     username = message.from_user.username or f"user_{user_id}"
     
     logger.info(f"Пользователь {username} (ID: {user_id}) запустил бота")
+    funnel.record(message.from_user, "start", source_from_start(message.text))
     
     # Отправляем приветственное сообщение
     bot.send_message(
