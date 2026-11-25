@@ -2,7 +2,7 @@
 
 Шаги: start (нажал «Старт») → join (открыл «Вступить») → method (выбрал карту)
 → link (получил ссылку на оплату). Оплату и доступ берём из channel_members.
-Источник — метка из ссылки t.me/<бот>?start=<метка>, запоминается первая.
+Источник — метка из ссылки t.me/<бот>?start=instagram | telegram | youtube, запоминается первая.
 Храним только Telegram ID, ник, метку и время шагов. Админ в статистику не попадает.
 """
 
@@ -125,6 +125,9 @@ class Funnel:
             if len(rows) > 20:
                 lines.append("…показаны 20 самых крупных")
 
-        lines.append(f"\nСсылка с меткой: https://t.me/{self.bot_username}?start=mama1"
-                     "\n(метка: латиница, цифры, _ и -; своя на каждый рилс)")
+        base = f"https://t.me/{self.bot_username}?start="
+        lines.append("\nСсылки с меткой источника:"
+                     f"\nInstagram (шапка профиля, директ): {base}instagram"
+                     f"\nTelegram-канал: {base}telegram"
+                     f"\nYouTube: {base}youtube")
         return "\n".join(lines)

@@ -30,21 +30,21 @@ NOW = int(datetime(2026, 11, 29, 12, 0, tzinfo=timezone.utc).timestamp())
 f = Funnel(db, admin_id="111")
 
 # Метка из /start
-check("метка из /start", source_from_start("/start Mama1") == "mama1")
+check("метка из /start", source_from_start("/start Instagram") == "instagram")
 check("без метки", source_from_start("/start") is None)
 check("мусор в метке отбрасывается", source_from_start("/start <script>") is None)
 
 # Путь трёх людей + админ
-f.record(user(1, "a"), "start", "mama1", now=NOW)
+f.record(user(1, "a"), "start", "instagram", now=NOW)
 f.record(user(1, "a"), "join", now=NOW + 10)
 f.record(user(1, "a"), "method", now=NOW + 20)
 f.record(user(1, "a"), "link", now=NOW + 30)
-f.record(user(2, "b"), "start", "mama1", now=NOW)
+f.record(user(2, "b"), "start", "instagram", now=NOW)
 f.record(user(2, "b"), "join", now=NOW + 5)
 f.record(user(3), "start", None, now=NOW - 10 * 86400)
-f.record(user(3), "start", "bus1", now=NOW)   # вторая метка: первая пустая → берём bus1
-f.record(user(1, "a"), "start", "bus1", now=NOW + 99)  # у первого уже mama1 — не меняется
-f.record(user(111), "start", "mama1", now=NOW)  # админ не считается
+f.record(user(3), "start", "telegram", now=NOW)   # вторая метка: первая пустая → берём bus1
+f.record(user(1, "a"), "start", "telegram", now=NOW + 99)  # у первого уже mama1 — не меняется
+f.record(user(111), "start", "instagram", now=NOW)  # админ не считается
 f.record(user(4), "nonsense", now=NOW)  # неизвестный шаг игнорируется
 
 with sqlite3.connect(db) as c:
@@ -52,8 +52,8 @@ with sqlite3.connect(db) as c:
     first_join = c.execute("SELECT join_at FROM funnel_users WHERE user_id='1'").fetchone()[0]
 check("админ не попал в статистику", "111" not in rows)
 check("неизвестный шаг не создаёт запись", "4" not in rows)
-check("первая метка не перезаписывается", rows["1"] == "mama1")
-check("пустая метка дополняется", rows["3"] == "bus1")
+check("первая метка не перезаписывается", rows["1"] == "instagram")
+check("пустая метка дополняется", rows["3"] == "telegram")
 f.record(user(1, "a"), "join", now=NOW + 500)
 with sqlite3.connect(db) as c:
     check("время шага — первое", c.execute("SELECT join_at FROM funnel_users WHERE user_id='1'").fetchone()[0] == first_join)
@@ -76,9 +76,9 @@ check("воронка за всё время", "Всё время: 3 → 2 → 1
 check("за 7 дней не видно пришедшего 10 дней назад", "7 дней: 2 → 2 → 1 → 1 → 2" in r)
 check("сейчас в клубе 2, отключил 1", "Сейчас в клубе: 2 (из них отключили автопродление: 1)" in r)
 check("ушли 1", "Ушли или не продлили: 1" in r)
-check("источник mama1", "mama1: 2 · 1 · 2 · 2" in r)
+check("источник mama1", "instagram: 2 · 1 · 2 · 2" in r)
 check("ссылка есть, оплаты нет: 0 (единственный со ссылкой оплатил)", "не оплатили: 0" in r)
-f.record(user(6), "start", "mama1", now=NOW)
+f.record(user(6), "start", "instagram", now=NOW)
 f.record(user(6), "link", now=NOW + 1)
 check("ссылка есть, оплаты нет: 1", "не оплатили: 1" in f.report(now=NOW + 100))
 
